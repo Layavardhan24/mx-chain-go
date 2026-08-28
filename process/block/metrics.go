@@ -1,0 +1,315 @@
+package block
+
+import (
+	"bytes"
+	"encoding/hex"
+	"fmt"
+
+	"github.com/multiversx/mx-chain-core-go/core"
+	"github.com/multiversx/mx-chain-core-go/core/check"
+	"github.com/multiversx/mx-chain-core-go/data"
+	"github.com/multiversx/mx-chain-core-go/data/block"
+	outportcore "github.com/multiversx/mx-chain-core-go/data/outport"
+	"github.com/multiversx/mx-chain-core-go/marshal"
+	logger "github.com/multiversx/mx-chain-logger-go"
+
+	"github.com/multiversx/mx-chain-go/common"
+	"github.com/multiversx/mx-chain-go/consensus"
+	"github.com/multiversx/mx-chain-go/outport"
+	"github.com/multiversx/mx-chain-go/process"
+	"github.com/multiversx/mx-chain-go/sharding/nodesCoordinator"
+)
+
+const leaderIndex = 0
+
+func getMetricsFromMetaHeader(
+	header data.MetaHeaderHandler,
+	marshalizer marshal.Marshalizer,
+	appStatusHandler core.AppStatusHandler,
+	numShardHeadersFromPool int,
+	numShardHeadersProcessed uint64,
+) {
+	numMiniBlocksMetaBlock := uint64(0)
+	headerSize := uint64(0)
+
+	for _, shardInfo := range header.GetShardInfoHandlers() {
+		numMiniBlocksMetaBlock += uint64(len(shardInfo.GetShardMiniBlockHeaderHandlers()))
+	}
+
+	marshalizedHeader, err := marshalizer.Marshal(header)
+	if err == nil {
+		headerSize = uint64(len(marshalizedHeader))
+	}
+
+	appStatusHandler.SetUInt64Value(common.MetricHeaderSize, headerSize)
+	appStatusHandler.SetUInt64Value(common.MetricNumTxInBlock, uint64(getMetaHeaderTxCount(header)))
+	appStatusHandler.SetUInt64Value(common.MetricNumMiniBlocks, numMiniBlocksMetaBlock)
+	appStatusHandler.SetUInt64Value(common.MetricNumShardHeadersProcessed, numShardHeadersProcessed)
+	appStatusHandler.SetUInt64Value(common.MetricNumShardHeadersFromPool, uint64(numShardHeadersFromPool))
+}
+
+func getMetaHeaderTxCount(header data.MetaHeaderHandler) uint32 {
+	if !header.IsHeaderV3() {
+		return header.GetTxCount()
+	}
+
+	txsInExecutionResults, err := getTxCountExecutionResults(header)
+	if err != nil {
+		log.Debug("getMetaHeaderTxCount: failed to compute tx count from execution results", "error", err)
+		return 0
+	}
+
+	return getTxCount(header.GetShardInfoHandlers()) + txsInExecutionResults
+}
+
+func getMetricsFromBlockBody(
+	body *block.Body,
+	marshalizer marshal.Marshalizer,
+	appStatusHandler core.AppStatusHandler,
+) {
+	mbLen := len(body.MiniBlocks)
+	miniblocksSize := uint64(0)
+	totalTxCount := 0
+	for i := 0; i < mbLen; i++ {
+		totalTxCount += len(body.MiniBlocks[i].TxHashes)
+
+		marshalizedBlock, err := marshalizer.Marshal(body.MiniBlocks[i])
+		if err == nil {
+			miniblocksSize += uint64(len(marshalizedBlock))
+		}
+	}
+	appStatusHandler.SetUInt64Value(common.MetricNumTxInBlock, uint64(totalTxCount))
+	appStatusHandler.SetUInt64Value(common.MetricNumMiniBlocks, uint64(mbLen))
+	appStatusHandler.SetUInt64Value(common.MetricMiniBlocksSize, miniblocksSize)
+}
+
+func getMetricsFromHeader(
+	header data.HeaderHandler,
+	numTxWithDst uint64,
+	marshalizer marshal.Marshalizer,
+	appStatusHandler core.AppStatusHandler,
+) {
+	headerSize := uint64(0)
+	marshalizedHeader, err := marshalizer.Marshal(header)
+	if err == nil {
+		headerSize = uint64(len(marshalizedHeader))
+	}
+
+	appStatusHandler.SetUInt64Value(common.MetricHeaderSize, headerSize)
+	appStatusHandler.SetUInt64Value(common.MetricTxPoolLoad, numTxWithDst)
+}
+
+func saveMetricsForCommittedShardBlock(
+	nodesCoordinator nodesCoordinator.NodesCoordinator,
+	appStatusHandler core.AppStatusHandler,
+	currentBlockHash string,
+	highestFinalBlockNonce uint64,
+	metaBlock data.HeaderHandler,
+	shardHeader data.HeaderHandler,
+	managedPeersHolder common.ManagedPeersHolder,
+) {
+	incrementMetricCountConsensusAcceptedBlocks(shardHeader, shardHeader.GetEpoch(), nodesCoordinator, appStatusHandler, managedPeersHolder)
+	appStatusHandler.SetUInt64Value(common.MetricEpochNumber, uint64(shardHeader.GetEpoch()))
+	appStatusHandler.SetStringValue(common.MetricCurrentBlockHash, currentBlockHash)
+	appStatusHandler.SetUInt64Value(common.MetricHighestFinalBlock, highestFinalBlockNonce)
+	appStatusHandler.SetStringValue(common.MetricCrossCheckBlockHeight, fmt.Sprintf("meta %d", metaBlock.GetNonce()))
+	appStatusHandler.SetUInt64Value(common.MetricCrossCheckBlockHeightMeta, metaBlock.GetNonce())
+}
+
+func saveMetricsForCommitMetachainBlock(
+	appStatusHandler core.AppStatusHandler,
+	header data.MetaHeaderHandler,
+	headerHash []byte,
+	nodesCoordinator nodesCoordinator.NodesCoordinator,
+	highestFinalBlockNonce uint64,
+	managedPeersHolder common.ManagedPeersHolder,
+) {
+	appStatusHandler.SetStringValue(common.MetricCurrentBlockHash, logger.DisplayByteSlice(headerHash))
+	appStatusHandler.SetUInt64Value(common.MetricEpochNumber, uint64(header.GetEpoch()))
+	appStatusHandler.SetUInt64Value(common.MetricHighestFinalBlock, highestFinalBlockNonce)
+
+	// TODO: remove if epoch start block needs to be validated by the new epoch nodes
+	epoch := header.GetEpoch()
+	if header.IsStartOfEpochBlock() && epoch > 0 {
+		epoch = epoch - 1
+	}
+
+	incrementMetricCountConsensusAcceptedBlocks(header, epoch, nodesCoordinator, appStatusHandler, managedPeersHolder)
+}
+
+func incrementMetricCountConsensusAcceptedBlocks(
+	header data.HeaderHandler,
+	epoch uint32,
+	nodesCoordinator nodesCoordinator.NodesCoordinator,
+	appStatusHandler core.AppStatusHandler,
+	managedPeersHolder common.ManagedPeersHolder,
+) {
+	_, pubKeys, err := nodesCoordinator.GetConsensusValidatorsPublicKeys(
+		header.GetPrevRandSeed(),
+		header.GetRound(),
+		header.GetShardID(),
+		epoch,
+	)
+	if err != nil {
+		log.Debug("cannot get validators public keys", "error", err.Error())
+		return
+	}
+
+	ownPublicKey := nodesCoordinator.GetOwnPublicKey()
+
+	for index, publicKey := range pubKeys {
+		if index == leaderIndex {
+			continue
+		}
+
+		isOwnKey := bytes.Equal([]byte(publicKey), ownPublicKey)
+		isManagedByCurrentNode := managedPeersHolder.IsKeyManagedByCurrentNode([]byte(publicKey))
+		if isOwnKey || isManagedByCurrentNode {
+			appStatusHandler.Increment(common.MetricCountConsensusAcceptedBlocks)
+		}
+	}
+}
+
+func indexRoundInfo(
+	outportHandler outport.OutportHandler,
+	nodesCoordinator nodesCoordinator.NodesCoordinator,
+	shardId uint32,
+	header data.HeaderHandler,
+	lastHeader data.HeaderHandler,
+	signersIndexes []uint64,
+	enableEpochsHandler common.EnableEpochsHandler,
+	roundHandler consensus.RoundHandler,
+) {
+	timestampSec, timestampMs, err := common.GetHeaderTimestamps(header, enableEpochsHandler)
+	if err != nil {
+		log.Warn("failed to get header timestamps", "error", err)
+		return
+	}
+
+	roundInfo := &outportcore.RoundInfo{
+		Round:            header.GetRound(),
+		SignersIndexes:   signersIndexes,
+		BlockWasProposed: true,
+		ShardId:          shardId,
+		Epoch:            header.GetEpoch(),
+		Timestamp:        timestampSec,
+		TimestampMs:      timestampMs,
+	}
+
+	if check.IfNil(lastHeader) {
+		outportHandler.SaveRoundsInfo(&outportcore.RoundsInfo{ShardID: shardId, RoundsInfo: []*outportcore.RoundInfo{roundInfo}})
+		return
+	}
+
+	lastBlockRound := lastHeader.GetRound()
+	currentBlockRound := header.GetRound()
+
+	roundsInfo := make([]*outportcore.RoundInfo, 0)
+	roundsInfo = append(roundsInfo, roundInfo)
+	epoch := header.GetEpoch()
+	for i := lastBlockRound + 1; i < currentBlockRound; i++ {
+		var ok bool
+		signersIndexes, ok = getSignersIndices(header, enableEpochsHandler, lastHeader, i, nodesCoordinator)
+		if !ok {
+			continue
+		}
+
+		roundTimestampMs := roundHandler.GetTimeStampForRound(i)
+		roundTimestampSec := roundTimestampMs / 1000
+
+		roundInfo = &outportcore.RoundInfo{
+			Round:            i,
+			SignersIndexes:   signersIndexes,
+			BlockWasProposed: false,
+			ShardId:          shardId,
+			Epoch:            epoch,
+			Timestamp:        roundTimestampSec,
+			TimestampMs:      roundTimestampMs,
+		}
+
+		roundsInfo = append(roundsInfo, roundInfo)
+	}
+
+	outportHandler.SaveRoundsInfo(&outportcore.RoundsInfo{ShardID: shardId, RoundsInfo: roundsInfo})
+}
+
+func getSignersIndices(
+	header data.HeaderHandler,
+	enableEpochsHandler common.EnableEpochsHandler,
+	lastHeader data.HeaderHandler,
+	round uint64,
+	nodesCoordinator nodesCoordinator.NodesCoordinator,
+) ([]uint64, bool) {
+	// if AndromedaFlag is active and all validators are in consensus group - signer indices no longer needed
+	if common.IsFlagEnabledAfterEpochsStartBlock(header, enableEpochsHandler, common.AndromedaFlag) {
+		return make([]uint64, 0), true
+	}
+
+	_, publicKeys, err := nodesCoordinator.GetConsensusValidatorsPublicKeys(lastHeader.GetRandSeed(), round, header.GetShardID(), lastHeader.GetEpoch())
+	if err != nil {
+		log.Error("getSignersIndices: cannot get validators public keys", "error", err.Error(), "round", round)
+		return nil, false
+	}
+
+	signersIndexes, err := nodesCoordinator.GetValidatorsIndexes(publicKeys, lastHeader.GetEpoch())
+	if err != nil {
+		log.Error("getSignersIndices: cannot get signers indices", "error", err.Error(), "round", round)
+		return nil, false
+	}
+
+	return signersIndexes, true
+}
+
+func indexValidatorsRating(
+	outportHandler outport.OutportHandler,
+	valStatProc process.ValidatorStatisticsProcessor,
+	metaBlock data.HeaderHandler,
+) {
+	// TODO use validatorInfoProvider  to get information about rating
+	latestHash, err := valStatProc.RootHash()
+	if err != nil {
+		return
+	}
+
+	validators, err := valStatProc.GetValidatorInfoForRootHash(latestHash)
+	if err != nil {
+		return
+	}
+
+	for shardID, validatorInfosInShard := range validators.GetShardValidatorsInfoMap() {
+		validatorsInfos := make([]*outportcore.ValidatorRatingInfo, 0)
+		for _, validatorInfo := range validatorInfosInShard {
+			validatorsInfos = append(validatorsInfos, &outportcore.ValidatorRatingInfo{
+				PublicKey: hex.EncodeToString(validatorInfo.GetPublicKey()),
+				Rating:    float32(validatorInfo.GetRating()) * 100 / 10000000,
+			})
+		}
+
+		outportHandler.SaveValidatorsRating(&outportcore.ValidatorsRating{
+			ShardID:              shardID,
+			Epoch:                metaBlock.GetEpoch(),
+			ValidatorsRatingInfo: validatorsInfos,
+		})
+	}
+}
+
+func calculateRoundDuration(
+	lastBlockTimestamp uint64,
+	currentBlockTimestamp uint64,
+	lastBlockRound uint64,
+	currentBlockRound uint64,
+) uint64 {
+	if lastBlockTimestamp >= currentBlockTimestamp {
+		log.Debug("last block timestamp is greater or equals than current block timestamp")
+		return 0
+	}
+	if lastBlockRound >= currentBlockRound {
+		log.Debug("last block round is greater or equals than current block round")
+		return 0
+	}
+
+	diffTimeStamp := currentBlockTimestamp - lastBlockTimestamp
+	diffRounds := currentBlockRound - lastBlockRound
+
+	return diffTimeStamp / diffRounds
+}

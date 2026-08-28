@@ -1,0 +1,15 @@
+[[Observers]]
+   ShardId = 0
+   Address = "http://0.0.0.0:10000"
+
+
+[[Observers]]
+   ShardId = 1
+   Address = "http://0.0.0.0:10001"
+
+
+[[Observers]]
+   ShardId = 4294967295
+   Address = "http://0.0.0.0:10002"
+
+

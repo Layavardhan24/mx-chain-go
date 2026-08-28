@@ -1,0 +1,197 @@
+package track
+
+import (
+	"bytes"
+
+	"github.com/multiversx/mx-chain-core-go/core"
+	"github.com/multiversx/mx-chain-core-go/data"
+
+	"github.com/multiversx/mx-chain-go/process"
+)
+
+type shardBlockTrack struct {
+	*baseBlockTrack
+}
+
+// NewShardBlockTrack creates an object for tracking the received shard blocks
+func NewShardBlockTrack(arguments ArgShardTracker) (*shardBlockTrack, error) {
+	err := checkTrackerNilParameters(arguments.ArgBaseTracker)
+	if err != nil {
+		return nil, err
+	}
+
+	bbt, err := createBaseBlockTrack(arguments.ArgBaseTracker)
+	if err != nil {
+		return nil, err
+	}
+
+	err = bbt.initNotarizedHeaders(arguments.StartHeaders)
+	if err != nil {
+		return nil, err
+	}
+
+	sbt := shardBlockTrack{
+		baseBlockTrack: bbt,
+	}
+
+	argBlockProcessor := ArgBlockProcessor{
+		HeaderValidator:                       arguments.HeaderValidator,
+		RequestHandler:                        arguments.RequestHandler,
+		ShardCoordinator:                      arguments.ShardCoordinator,
+		BlockTracker:                          &sbt,
+		CrossNotarizer:                        bbt.crossNotarizer,
+		SelfNotarizer:                         bbt.selfNotarizer,
+		CrossNotarizedHeadersNotifier:         bbt.crossNotarizedHeadersNotifier,
+		SelfNotarizedFromCrossHeadersNotifier: bbt.selfNotarizedFromCrossHeadersNotifier,
+		SelfNotarizedHeadersNotifier:          bbt.selfNotarizedHeadersNotifier,
+		FinalMetachainHeadersNotifier:         bbt.finalMetachainHeadersNotifier,
+		RoundHandler:                          arguments.RoundHandler,
+		ProcessConfigsHandler:                 arguments.ProcessConfigsHandler,
+		EnableEpochsHandler:                   arguments.EnableEpochsHandler,
+		EnableRoundsHandler:                   arguments.EnableRoundsHandler,
+		ProofsPool:                            arguments.ProofsPool,
+		Marshaller:                            arguments.Marshalizer,
+		Hasher:                                arguments.Hasher,
+		HeadersPool:                           arguments.PoolsHolder.Headers(),
+		IsImportDBMode:                        arguments.IsImportDBMode,
+	}
+
+	blockProcessorObject, err := NewBlockProcessor(argBlockProcessor)
+	if err != nil {
+		return nil, err
+	}
+
+	sbt.blockProcessor = blockProcessorObject
+	sbt.headers = make(map[uint32]map[uint64][]*HeaderInfo)
+	sbt.headersPool.RegisterHandler(sbt.receivedHeader)
+	sbt.proofsPool.RegisterHandler(sbt.receivedProof)
+	sbt.headersPool.Clear()
+
+	return &sbt, nil
+}
+
+// GetSelfHeaders gets a slice of self headers from a given metablock
+func (sbt *shardBlockTrack) GetSelfHeaders(headerHandler data.HeaderHandler) []*HeaderInfo {
+	selfHeadersInfo := make([]*HeaderInfo, 0)
+
+	metaBlock, ok := headerHandler.(data.MetaHeaderHandler)
+	if !ok {
+		log.Debug("GetSelfHeaders", "error", process.ErrWrongTypeAssertion)
+		return selfHeadersInfo
+	}
+
+	for _, shardInfo := range metaBlock.GetShardInfoHandlers() {
+		if shardInfo.GetShardID() != sbt.shardCoordinator.SelfId() {
+			continue
+		}
+
+		header, err := process.GetShardHeader(shardInfo.GetHeaderHash(), sbt.headersPool, sbt.marshalizer, sbt.store)
+		if err != nil {
+			log.Trace("GetSelfHeaders.GetShardHeader", "error", err.Error())
+
+			header, err = sbt.getTrackedShardHeaderWithNonceAndHash(shardInfo.GetShardID(), shardInfo.GetNonce(), shardInfo.GetHeaderHash())
+			if err != nil {
+				log.Trace("GetSelfHeaders.getTrackedShardHeaderWithNonceAndHash", "error", err.Error())
+				continue
+			}
+		}
+
+		selfHeadersInfo = append(selfHeadersInfo, &HeaderInfo{Hash: shardInfo.GetHeaderHash(), Header: header})
+	}
+
+	return selfHeadersInfo
+}
+
+func (sbt *shardBlockTrack) getTrackedShardHeaderWithNonceAndHash(
+	shardID uint32,
+	nonce uint64,
+	hash []byte,
+) (data.ShardHeaderHandler, error) {
+
+	headers, headersHashes := sbt.GetTrackedHeadersWithNonce(shardID, nonce)
+	for i := 0; i < len(headers); i++ {
+		if !bytes.Equal(headersHashes[i], hash) {
+			continue
+		}
+
+		header, ok := headers[i].(data.ShardHeaderHandler)
+		if !ok {
+			return nil, process.ErrWrongTypeAssertion
+		}
+
+		return header, nil
+	}
+
+	return nil, process.ErrMissingHeader
+}
+
+// CleanupInvalidCrossHeaders cleans headers added to the block tracker that have become invalid after processing
+func (sbt *shardBlockTrack) CleanupInvalidCrossHeaders(_ uint32, _ uint64) {
+	// no rule for shard
+}
+
+// ComputeLongestSelfChain computes the longest chain from self shard
+func (sbt *shardBlockTrack) ComputeLongestSelfChain() (data.HeaderHandler, []byte, []data.HeaderHandler, [][]byte) {
+	lastSelfNotarizedHeader, lastSelfNotarizedHeaderHash, err := sbt.selfNotarizer.GetLastNotarizedHeader(core.MetachainShardId)
+	if err != nil {
+		log.Warn("ComputeLongestSelfChain.GetLastNotarizedHeader", "error", err.Error())
+		return nil, nil, nil, nil
+	}
+
+	headers, hashes := sbt.ComputeLongestChain(sbt.shardCoordinator.SelfId(), lastSelfNotarizedHeader)
+	return lastSelfNotarizedHeader, lastSelfNotarizedHeaderHash, headers, hashes
+}
+
+// ComputeCrossInfo computes the cross info from a given slice of metablocks
+func (sbt *shardBlockTrack) ComputeCrossInfo(headers []data.HeaderHandler) {
+	lenHeaders := len(headers)
+	if lenHeaders == 0 {
+		return
+	}
+
+	metaBlock, ok := headers[lenHeaders-1].(data.MetaHeaderHandler)
+	if !ok {
+		log.Debug("ComputeCrossInfo", "error", process.ErrWrongTypeAssertion)
+		return
+	}
+
+	sbt.setShardInfoData(metaBlock)
+
+	log.Debug("compute cross info from meta block",
+		"epoch", metaBlock.GetEpoch(),
+		"round", metaBlock.GetRound(),
+		"nonce", metaBlock.GetNonce(),
+	)
+
+	for shardID := uint32(0); shardID < sbt.shardCoordinator.NumberOfShards(); shardID++ {
+		log.Debug("cross info",
+			"shard", shardID,
+			"pending miniblocks", sbt.blockBalancer.GetNumPendingMiniBlocks(shardID),
+			"last meta nonce processed", sbt.blockBalancer.GetLastShardProcessedMetaNonce(shardID),
+			"shard is stuck", sbt.IsShardStuck(shardID),
+			"global chain stuck", sbt.ShouldSkipMiniBlocksCreationFromSelf())
+	}
+}
+
+func (sbt *shardBlockTrack) setShardInfoData(
+	metaBlock data.MetaHeaderHandler,
+) {
+	for _, shardInfo := range metaBlock.GetShardInfoHandlers() {
+		if !metaBlock.IsHeaderV3() {
+			sbt.blockBalancer.SetNumPendingMiniBlocks(shardInfo.GetShardID(), shardInfo.GetNumPendingMiniBlocks())
+		}
+
+		sbt.blockBalancer.SetLastShardProcessedMetaNonce(shardInfo.GetShardID(), shardInfo.GetLastIncludedMetaNonce())
+	}
+
+	for _, shardInfo := range metaBlock.GetShardInfoProposalHandlers() {
+		if metaBlock.IsHeaderV3() {
+			sbt.blockBalancer.SetNumPendingMiniBlocks(shardInfo.GetShardID(), shardInfo.GetNumPendingMiniBlocks())
+		}
+	}
+}
+
+// IsInterfaceNil returns true if there is no value under the interface
+func (sbt *shardBlockTrack) IsInterfaceNil() bool {
+	return sbt == nil
+}

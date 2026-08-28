@@ -1,0 +1,1733 @@
+package shardchain
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"math"
+	"sort"
+	"sync"
+	"time"
+
+	"github.com/multiversx/mx-chain-core-go/core"
+	"github.com/multiversx/mx-chain-core-go/core/atomic"
+	"github.com/multiversx/mx-chain-core-go/core/check"
+	"github.com/multiversx/mx-chain-core-go/core/closing"
+	"github.com/multiversx/mx-chain-core-go/data"
+	"github.com/multiversx/mx-chain-core-go/data/block"
+	"github.com/multiversx/mx-chain-core-go/data/typeConverters"
+	"github.com/multiversx/mx-chain-core-go/display"
+	"github.com/multiversx/mx-chain-core-go/hashing"
+	"github.com/multiversx/mx-chain-core-go/marshal"
+	logger "github.com/multiversx/mx-chain-logger-go"
+
+	"github.com/multiversx/mx-chain-go/common"
+	"github.com/multiversx/mx-chain-go/dataRetriever"
+	"github.com/multiversx/mx-chain-go/epochStart"
+	"github.com/multiversx/mx-chain-go/process"
+	"github.com/multiversx/mx-chain-go/process/track"
+	"github.com/multiversx/mx-chain-go/storage"
+)
+
+var log = logger.GetOrCreate("epochStart/shardchain")
+
+var _ dataRetriever.EpochHandler = (*trigger)(nil)
+var _ epochStart.TriggerHandler = (*trigger)(nil)
+var _ process.EpochStartTriggerHandler = (*trigger)(nil)
+var _ process.EpochBootstrapper = (*trigger)(nil)
+var _ closing.Closer = (*trigger)(nil)
+
+// sleepTime defines the time in milliseconds between each iteration made in requestMissingMiniBlocks method
+const sleepTime = 200 * time.Millisecond
+
+const numRoundsWithoutReceivedMetaBlocks = 5
+
+const defaultPendingProofRetryInterval = time.Second
+const maxPendingProofRequestsPerPass = 16
+
+// ArgsShardEpochStartTrigger struct { defines the arguments needed for new start of epoch trigger
+type ArgsShardEpochStartTrigger struct {
+	Marshalizer marshal.Marshalizer
+	Hasher      hashing.Hasher
+
+	HeaderValidator epochStart.HeaderValidator
+	Uint64Converter typeConverters.Uint64ByteSliceConverter
+
+	DataPool                                    dataRetriever.PoolsHolder
+	Storage                                     dataRetriever.StorageService
+	RequestHandler                              epochStart.RequestHandler
+	EpochStartNotifier                          epochStart.Notifier
+	PeerMiniBlocksSyncer                        process.ValidatorInfoSyncer
+	RoundHandler                                process.RoundHandler
+	AppStatusHandler                            core.AppStatusHandler
+	EnableEpochsHandler                         common.EnableEpochsHandler
+	ExtraDelayForRequestBlockInfoInMilliseconds int
+
+	Epoch    uint32
+	Validity uint64
+	Finality uint64
+}
+
+type trigger struct {
+	currentRoundIndex           int64
+	epochStartRound             uint64
+	epochMetaBlockHash          []byte
+	triggerStateKey             []byte
+	finality                    uint64
+	validity                    uint64
+	epochFinalityAttestingRound uint64
+	epochStartShardHeader       data.HeaderHandler
+	epochStartMeta              data.HeaderHandler
+
+	mutTrigger                sync.RWMutex
+	mapHashHdr                map[string]data.HeaderHandler
+	mapNonceHashes            map[uint64][]string
+	mapEpochStartHdrs         map[string]data.HeaderHandler
+	mapFinalizedEpochs        map[uint32]string
+	mapPreparedEpochStartHdrs map[string]struct{}
+
+	headersPool                   dataRetriever.HeadersPool
+	proofsPool                    dataRetriever.ProofsPool
+	metaFinalityView              process.MetaFinalityView
+	miniBlocksPool                storage.Cacher
+	validatorInfoPool             dataRetriever.ShardedDataCacherNotifier
+	currentEpochValidatorInfoPool epochStart.ValidatorInfoCacher
+	shardHdrStorage               storage.Storer
+	metaHdrStorage                storage.Storer
+	triggerStorage                storage.Storer
+	metaNonceHdrStorage           storage.Storer
+
+	uint64Converter typeConverters.Uint64ByteSliceConverter
+
+	marshaller      marshal.Marshalizer
+	hasher          hashing.Hasher
+	headerValidator epochStart.HeaderValidator
+
+	requestHandler     epochStart.RequestHandler
+	epochStartNotifier epochStart.Notifier
+	roundHandler       process.RoundHandler
+
+	epoch                           uint32
+	metaEpoch                       uint32
+	newEpochHdrReceived             bool
+	isEpochStart                    bool
+	requestedFinalityAttestingBlock atomic.Flag
+
+	peerMiniBlocksSyncer process.ValidatorInfoSyncer
+
+	appStatusHandler              core.AppStatusHandler
+	enableEpochsHandler           common.EnableEpochsHandler
+	extraDelayForRequestBlockInfo time.Duration
+
+	mapMissingMiniBlocks     map[string]uint32
+	mapMissingValidatorsInfo map[string]uint32
+	mutMissingMiniBlocks     sync.RWMutex
+	mutMissingValidatorsInfo sync.RWMutex
+	cancelFunc               func()
+
+	chanMetaBlockReceived chan struct{}
+
+	mutPendingEpochStartData  sync.Mutex
+	pendingEpochStartProofs   map[string]pendingEpochStartProof
+	pendingEpochStartHeaders  map[uint32]struct{}
+	chanPendingEpochStartData chan struct{}
+	pendingProofRetryInterval time.Duration
+	nextProofRequestSequence  uint64
+}
+
+type pendingEpochStartProof struct {
+	epoch           uint32
+	requestSequence uint64
+}
+
+type metaInfo struct {
+	hdr  data.HeaderHandler
+	hash string
+}
+
+type metaInfoSlice []*metaInfo
+
+// Len will return the length of the metaInfoSlice
+func (m metaInfoSlice) Len() int { return len(m) }
+
+// Swap will interchange the objects on input indexes
+func (m metaInfoSlice) Swap(i, j int) { m[i], m[j] = m[j], m[i] }
+
+// Less will return true if object on index i should appear before object in index j
+// Sorting of headers should be by epoch, by nonce and by hash in ascending order
+// this will ensure that in case of equality for epoch, the metaHdr with higher nonce will
+// be processed last - that is  the correct one - as it finalizes the previous nonce
+func (m metaInfoSlice) Less(i, j int) bool {
+	if m[i].hdr.GetEpoch() == m[j].hdr.GetEpoch() {
+		if m[i].hdr.GetNonce() == m[j].hdr.GetNonce() {
+			return m[i].hash < m[j].hash
+		}
+		return m[i].hdr.GetNonce() < m[j].hdr.GetNonce()
+	}
+	return m[i].hdr.GetEpoch() < m[j].hdr.GetEpoch()
+}
+
+// NewEpochStartTrigger creates a trigger to signal start of epoch
+func NewEpochStartTrigger(args *ArgsShardEpochStartTrigger) (*trigger, error) {
+	if args == nil {
+		return nil, epochStart.ErrNilArgsNewShardEpochStartTrigger
+	}
+	if check.IfNil(args.Hasher) {
+		return nil, epochStart.ErrNilHasher
+	}
+	if check.IfNil(args.Marshalizer) {
+		return nil, epochStart.ErrNilMarshalizer
+	}
+	if check.IfNil(args.HeaderValidator) {
+		return nil, epochStart.ErrNilHeaderValidator
+	}
+	if check.IfNil(args.DataPool) {
+		return nil, epochStart.ErrNilDataPoolsHolder
+	}
+	if check.IfNil(args.Storage) {
+		return nil, epochStart.ErrNilStorageService
+	}
+	if check.IfNil(args.RequestHandler) {
+		return nil, epochStart.ErrNilRequestHandler
+	}
+	if check.IfNil(args.DataPool.Headers()) {
+		return nil, epochStart.ErrNilMetaBlocksPool
+	}
+	if check.IfNil(args.DataPool.Proofs()) {
+		return nil, epochStart.ErrNilProofsPool
+	}
+	if check.IfNil(args.DataPool.MiniBlocks()) {
+		return nil, epochStart.ErrNilMiniBlockPool
+	}
+	if check.IfNil(args.DataPool.ValidatorsInfo()) {
+		return nil, epochStart.ErrNilValidatorsInfoPool
+	}
+	if check.IfNil(args.DataPool.CurrentEpochValidatorInfo()) {
+		return nil, epochStart.ErrNilCurrentEpochValidatorsInfoPool
+	}
+	if check.IfNil(args.PeerMiniBlocksSyncer) {
+		return nil, epochStart.ErrNilValidatorInfoProcessor
+	}
+	if check.IfNil(args.Uint64Converter) {
+		return nil, epochStart.ErrNilUint64Converter
+	}
+	if check.IfNil(args.EpochStartNotifier) {
+		return nil, epochStart.ErrNilEpochStartNotifier
+	}
+	if check.IfNil(args.RoundHandler) {
+		return nil, epochStart.ErrNilRoundHandler
+	}
+	if check.IfNil(args.AppStatusHandler) {
+		return nil, epochStart.ErrNilStatusHandler
+	}
+	if check.IfNil(args.EnableEpochsHandler) {
+		return nil, epochStart.ErrNilEnableEpochsHandler
+	}
+	if args.ExtraDelayForRequestBlockInfoInMilliseconds < 0 {
+		return nil, process.ErrNegativeValue
+	}
+	err := core.CheckHandlerCompatibility(args.EnableEpochsHandler, []core.EnableEpochFlag{
+		common.RefactorPeersMiniBlocksFlag,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	metaHdrStorage, err := args.Storage.GetStorer(dataRetriever.MetaBlockUnit)
+	if err != nil {
+		return nil, err
+	}
+
+	triggerStorage, err := args.Storage.GetStorer(dataRetriever.BootstrapUnit)
+	if err != nil {
+		return nil, err
+	}
+
+	metaHdrNoncesStorage, err := args.Storage.GetStorer(dataRetriever.MetaHdrNonceHashDataUnit)
+	if err != nil {
+		return nil, err
+	}
+
+	shardHdrStorage, err := args.Storage.GetStorer(dataRetriever.BlockHeaderUnit)
+	if err != nil {
+		return nil, err
+	}
+
+	// built over the trigger's own pools so activation shares the node-wide finality definition
+	metaFinalityView, err := track.NewMetaFinalityView(track.ArgsMetaFinalityView{
+		HeadersPool: args.DataPool.Headers(),
+		ProofsPool:  args.DataPool.Proofs(),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	triggerStateKey := common.TriggerRegistryInitialKeyPrefix + fmt.Sprintf("%d", args.Epoch)
+	t := &trigger{
+		triggerStateKey:               []byte(triggerStateKey),
+		epoch:                         args.Epoch,
+		metaEpoch:                     args.Epoch,
+		currentRoundIndex:             0,
+		epochStartRound:               0,
+		epochFinalityAttestingRound:   0,
+		isEpochStart:                  false,
+		validity:                      args.Validity,
+		finality:                      args.Finality,
+		newEpochHdrReceived:           false,
+		mutTrigger:                    sync.RWMutex{},
+		mapHashHdr:                    make(map[string]data.HeaderHandler),
+		mapNonceHashes:                make(map[uint64][]string),
+		mapEpochStartHdrs:             make(map[string]data.HeaderHandler),
+		mapFinalizedEpochs:            make(map[uint32]string),
+		headersPool:                   args.DataPool.Headers(),
+		proofsPool:                    args.DataPool.Proofs(),
+		metaFinalityView:              metaFinalityView,
+		miniBlocksPool:                args.DataPool.MiniBlocks(),
+		validatorInfoPool:             args.DataPool.ValidatorsInfo(),
+		currentEpochValidatorInfoPool: args.DataPool.CurrentEpochValidatorInfo(),
+		metaHdrStorage:                metaHdrStorage,
+		shardHdrStorage:               shardHdrStorage,
+		triggerStorage:                triggerStorage,
+		metaNonceHdrStorage:           metaHdrNoncesStorage,
+		uint64Converter:               args.Uint64Converter,
+		marshaller:                    args.Marshalizer,
+		hasher:                        args.Hasher,
+		headerValidator:               args.HeaderValidator,
+		requestHandler:                args.RequestHandler,
+		epochMetaBlockHash:            nil,
+		epochStartNotifier:            args.EpochStartNotifier,
+		epochStartMeta:                &block.MetaBlock{},
+		epochStartShardHeader:         &block.Header{},
+		peerMiniBlocksSyncer:          args.PeerMiniBlocksSyncer,
+		appStatusHandler:              args.AppStatusHandler,
+		roundHandler:                  args.RoundHandler,
+		enableEpochsHandler:           args.EnableEpochsHandler,
+		extraDelayForRequestBlockInfo: time.Duration(args.ExtraDelayForRequestBlockInfoInMilliseconds) * time.Millisecond,
+		chanMetaBlockReceived:         make(chan struct{}, 1),
+		pendingEpochStartProofs:       make(map[string]pendingEpochStartProof),
+		pendingEpochStartHeaders:      make(map[uint32]struct{}),
+		chanPendingEpochStartData:     make(chan struct{}, 1),
+		pendingProofRetryInterval:     defaultPendingProofRetryInterval,
+	}
+
+	t.headersPool.RegisterHandler(t.receivedMetaBlock)
+	t.proofsPool.RegisterHandler(t.receivedProof)
+
+	err = t.saveState(t.triggerStateKey)
+	if err != nil {
+		return nil, err
+	}
+
+	t.mapMissingMiniBlocks = make(map[string]uint32)
+	t.mapMissingValidatorsInfo = make(map[string]uint32)
+	t.mapPreparedEpochStartHdrs = make(map[string]struct{})
+
+	var ctx context.Context
+	ctx, t.cancelFunc = context.WithCancel(context.Background())
+	go t.requestMissingMiniBlocks(ctx)
+	go t.requestMissingValidatorsInfo(ctx)
+	go t.watchdogRequestEpochStartMetaBlock(ctx)
+	go t.requestPendingEpochStartProofs(ctx)
+
+	return t, nil
+}
+
+func (t *trigger) getExtraDelayForRequestsBlockInfo() time.Duration {
+	return t.extraDelayForRequestBlockInfo
+}
+
+func (t *trigger) clearMissingMiniBlocksMap(epoch uint32) {
+	t.mutMissingMiniBlocks.Lock()
+	defer t.mutMissingMiniBlocks.Unlock()
+
+	for hash, epochOfMissingMb := range t.mapMissingMiniBlocks {
+		if epochOfMissingMb <= epoch {
+			delete(t.mapMissingMiniBlocks, hash)
+		}
+	}
+}
+
+func (t *trigger) clearMissingValidatorsInfoMap(epoch uint32) {
+	t.mutMissingValidatorsInfo.Lock()
+	defer t.mutMissingValidatorsInfo.Unlock()
+
+	for hash, epochOfMissingValidatorInfo := range t.mapMissingValidatorsInfo {
+		if epochOfMissingValidatorInfo <= epoch {
+			delete(t.mapMissingValidatorsInfo, hash)
+		}
+	}
+}
+
+func (t *trigger) requestMissingMiniBlocks(ctx context.Context) {
+	timer := time.NewTimer(sleepTime)
+	defer timer.Stop()
+
+	for {
+		timer.Reset(sleepTime)
+
+		select {
+		case <-ctx.Done():
+			log.Debug("requestMissingMiniBlocks: trigger's go routine is stopping...")
+			return
+		case <-timer.C:
+		}
+
+		t.mutMissingMiniBlocks.RLock()
+		if len(t.mapMissingMiniBlocks) == 0 {
+			t.mutMissingMiniBlocks.RUnlock()
+
+			t.mutTrigger.Lock()
+			if !t.isEpochStart {
+				t.updateTriggerFromMeta()
+			}
+			t.mutTrigger.Unlock()
+
+			continue
+		}
+
+		missingMiniBlocks := make([][]byte, 0, len(t.mapMissingMiniBlocks))
+		for hash, epoch := range t.mapMissingMiniBlocks {
+			missingMiniBlocks = append(missingMiniBlocks, []byte(hash))
+			log.Debug("trigger.requestMissingMiniBlocks", "epoch", epoch, "hash", []byte(hash))
+		}
+		t.mutMissingMiniBlocks.RUnlock()
+
+		go t.requestHandler.RequestMiniBlocks(core.MetachainShardId, missingMiniBlocks)
+
+		timer.Reset(waitTime)
+
+		select {
+		case <-ctx.Done():
+			log.Debug("requestMissingMiniBlocks: trigger's go routine is stopping...")
+			return
+		case <-timer.C:
+		}
+
+		t.updateMissingMiniBlocks()
+	}
+}
+
+func (t *trigger) requestMissingValidatorsInfo(ctx context.Context) {
+	timer := time.NewTimer(sleepTime)
+	defer timer.Stop()
+
+	for {
+		timer.Reset(sleepTime)
+
+		select {
+		case <-ctx.Done():
+			log.Debug("requestMissingValidatorsInfo: trigger's go routine is stopping...")
+			return
+		case <-timer.C:
+		}
+
+		t.mutMissingValidatorsInfo.RLock()
+		if len(t.mapMissingValidatorsInfo) == 0 {
+			t.mutMissingValidatorsInfo.RUnlock()
+			continue
+		}
+
+		missingValidatorsInfo := make([][]byte, 0, len(t.mapMissingValidatorsInfo))
+		for hash, epoch := range t.mapMissingValidatorsInfo {
+			missingValidatorsInfo = append(missingValidatorsInfo, []byte(hash))
+			log.Debug("trigger.requestMissingValidatorsInfo", "epoch", epoch, "hash", []byte(hash))
+		}
+		t.mutMissingValidatorsInfo.RUnlock()
+
+		go t.requestHandler.RequestValidatorsInfo(missingValidatorsInfo)
+
+		timer.Reset(waitTime)
+
+		select {
+		case <-ctx.Done():
+			log.Debug("requestMissingValidatorsInfo: trigger's go routine is stopping...")
+			return
+		case <-timer.C:
+		}
+
+		t.updateMissingValidatorsInfo()
+	}
+}
+
+func (t *trigger) updateMissingMiniBlocks() {
+	t.mutMissingMiniBlocks.Lock()
+	for hash := range t.mapMissingMiniBlocks {
+		if t.miniBlocksPool.Has([]byte(hash)) {
+			delete(t.mapMissingMiniBlocks, hash)
+		}
+	}
+	numMissingMiniBlocks := len(t.mapMissingMiniBlocks)
+	t.mutMissingMiniBlocks.Unlock()
+
+	if numMissingMiniBlocks == 0 {
+		log.Debug("trigger.updateMissingMiniBlocks -> updateTriggerFromMeta")
+		t.mutTrigger.Lock()
+		t.updateTriggerFromMeta()
+		t.mutTrigger.Unlock()
+	}
+}
+
+func (t *trigger) updateMissingValidatorsInfo() {
+	t.mutMissingValidatorsInfo.Lock()
+	for hash := range t.mapMissingValidatorsInfo {
+		_, isValidatorInfoFound := t.validatorInfoPool.SearchFirstData([]byte(hash))
+		if isValidatorInfoFound {
+			delete(t.mapMissingValidatorsInfo, hash)
+		}
+	}
+	numMissingValidatorsInfo := len(t.mapMissingValidatorsInfo)
+	t.mutMissingValidatorsInfo.Unlock()
+
+	if numMissingValidatorsInfo == 0 {
+		log.Debug("trigger.updateMissingValidatorsInfo -> updateTriggerFromMeta")
+		t.mutTrigger.Lock()
+		t.updateTriggerFromMeta()
+		t.mutTrigger.Unlock()
+	}
+}
+
+// IsEpochStart returns true if conditions are fulfilled for start of epoch
+func (t *trigger) IsEpochStart() bool {
+	t.mutTrigger.RLock()
+	defer t.mutTrigger.RUnlock()
+
+	return t.isEpochStart
+}
+
+// Epoch returns the current epoch number
+func (t *trigger) Epoch() uint32 {
+	t.mutTrigger.RLock()
+	defer t.mutTrigger.RUnlock()
+
+	return t.epoch
+}
+
+// MetaEpoch returns the highest finalized meta epoch number
+func (t *trigger) MetaEpoch() uint32 {
+	t.mutTrigger.RLock()
+	defer t.mutTrigger.RUnlock()
+
+	return t.metaEpoch
+}
+
+// EpochStartRound returns the start round of the current epoch
+func (t *trigger) EpochStartRound() uint64 {
+	t.mutTrigger.RLock()
+	defer t.mutTrigger.RUnlock()
+
+	return t.epochStartRound
+}
+
+// EpochFinalityAttestingRound returns the round when epoch start block was finalized
+func (t *trigger) EpochFinalityAttestingRound() uint64 {
+	t.mutTrigger.Lock()
+	defer t.mutTrigger.Unlock()
+
+	return t.epochFinalityAttestingRound
+}
+
+// ForceEpochStart does nothing in this implementation
+func (t *trigger) ForceEpochStart(_ uint64) {
+}
+
+// RequestEpochStartIfNeeded request the needed epoch start block if metablock with new epoch was received
+func (t *trigger) RequestEpochStartIfNeeded(interceptedHeader data.HeaderHandler) {
+	if interceptedHeader.IsStartOfEpochBlock() {
+		return
+	}
+	if interceptedHeader.GetEpoch() <= t.Epoch() {
+		return
+	}
+	_, ok := interceptedHeader.(data.MetaHeaderHandler)
+	if !ok {
+		return
+	}
+
+	t.mutTrigger.Lock()
+	defer t.mutTrigger.Unlock()
+
+	found := false
+	for _, header := range t.mapEpochStartHdrs {
+		if header.GetEpoch() >= interceptedHeader.GetEpoch() {
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		t.requestHandler.RequestStartOfEpochMetaBlock(interceptedHeader.GetEpoch())
+	}
+}
+
+func (t *trigger) changeEpochFinalityAttestingRoundIfNeeded(
+	metaHdr data.MetaHeaderHandler,
+	receivedHash []byte,
+) {
+	hash := t.mapFinalizedEpochs[metaHdr.GetEpoch()]
+	epochStartMetaHdr := t.mapEpochStartHdrs[hash]
+	if check.IfNil(epochStartMetaHdr) {
+		return
+	}
+
+	isHeaderOnTopOfFinalityAttestingRound := metaHdr.GetNonce() == epochStartMetaHdr.GetNonce()+t.finality+1
+	if isHeaderOnTopOfFinalityAttestingRound {
+		metaHdrWithFinalityAttestingRound, err := t.getHeaderWithNonceAndHash(epochStartMetaHdr.GetNonce()+t.finality, metaHdr.GetPrevHash())
+		if err != nil {
+			log.Debug("searched metaHeader was not found")
+			_ = t.requestedFinalityAttestingBlock.SetReturningPrevious()
+			return
+		}
+
+		t.epochFinalityAttestingRound = metaHdrWithFinalityAttestingRound.GetRound()
+		return
+	}
+
+	isFinalityAttestingBlock := metaHdr.GetNonce() == epochStartMetaHdr.GetNonce()+t.finality
+	if !isFinalityAttestingBlock {
+		return
+	}
+
+	err := t.headerValidator.IsHeaderConstructionValid(metaHdr, t.epochStartMeta)
+	if err != nil {
+		return
+	}
+
+	if t.requestedFinalityAttestingBlock.IsSet() {
+		_, err = t.getHeaderWithNonceAndPrevHash(metaHdr.GetNonce()+1, receivedHash)
+		if err != nil {
+			return
+		}
+
+		t.epochFinalityAttestingRound = metaHdr.GetRound()
+		t.requestedFinalityAttestingBlock.Reset()
+		return
+	}
+
+	if metaHdr.GetRound() >= t.epochFinalityAttestingRound {
+		return
+	}
+
+	t.epochFinalityAttestingRound = metaHdr.GetRound()
+}
+
+func (t *trigger) receivedProof(headerProof data.HeaderProofHandler) {
+	if check.IfNil(headerProof) {
+		return
+	}
+	if headerProof.GetHeaderShardId() != core.MetachainShardId {
+		return
+	}
+
+	log.Debug("received proof in trigger", "proof for header hash", headerProof.GetHeaderHash())
+	header, err := t.headersPool.GetHeaderByHash(headerProof.GetHeaderHash())
+	if err != nil || check.IfNil(header) {
+		return
+	}
+
+	t.processMetaHeaderWithProof(header, headerProof.GetHeaderHash())
+	t.removePendingEpochStartProof(string(headerProof.GetHeaderHash()), header.GetEpoch())
+	t.removePendingEpochStartHeader(header.GetEpoch())
+}
+
+func (t *trigger) processMetaHeaderWithProof(header data.HeaderHandler, metaBlockHash []byte) {
+	t.mutTrigger.Lock()
+	t.checkMetaHeaderForEpochTriggerEquivalentProofs(header, metaBlockHash)
+	t.mutTrigger.Unlock()
+}
+
+func (t *trigger) addPendingEpochStartProof(metaBlockHash []byte, epoch uint32) {
+	key := string(metaBlockHash)
+
+	t.mutPendingEpochStartData.Lock()
+	_, exists := t.pendingEpochStartProofs[key]
+	if !exists {
+		t.nextProofRequestSequence++
+		t.pendingEpochStartProofs[key] = pendingEpochStartProof{
+			epoch:           epoch,
+			requestSequence: t.nextProofRequestSequence,
+		}
+	}
+	t.mutPendingEpochStartData.Unlock()
+
+	if exists {
+		return
+	}
+
+	select {
+	case t.chanPendingEpochStartData <- struct{}{}:
+	default:
+	}
+}
+
+func (t *trigger) movePendingProofToHeaderRecovery(key string, epoch uint32) {
+	t.mutPendingEpochStartData.Lock()
+	current, found := t.pendingEpochStartProofs[key]
+	if found && current.epoch == epoch {
+		delete(t.pendingEpochStartProofs, key)
+		t.pendingEpochStartHeaders[epoch] = struct{}{}
+	}
+	t.mutPendingEpochStartData.Unlock()
+}
+
+// removePendingEpochStartProof deletes the entry only if it still holds the same epoch, so a
+// stale snapshot cannot remove state recreated by a concurrent callback
+func (t *trigger) removePendingEpochStartProof(key string, epoch uint32) {
+	t.mutPendingEpochStartData.Lock()
+	current, found := t.pendingEpochStartProofs[key]
+	if found && current.epoch == epoch {
+		delete(t.pendingEpochStartProofs, key)
+	}
+	t.mutPendingEpochStartData.Unlock()
+}
+
+func (t *trigger) removePendingEpochStartHeader(epoch uint32) {
+	t.mutPendingEpochStartData.Lock()
+	delete(t.pendingEpochStartHeaders, epoch)
+	t.mutPendingEpochStartData.Unlock()
+}
+
+func (t *trigger) pendingEpochStartDataSnapshot() (map[string]pendingEpochStartProof, map[uint32]struct{}) {
+	t.mutPendingEpochStartData.Lock()
+	defer t.mutPendingEpochStartData.Unlock()
+
+	pending := make(map[string]pendingEpochStartProof, len(t.pendingEpochStartProofs))
+	for key, info := range t.pendingEpochStartProofs {
+		pending[key] = info
+	}
+
+	pendingHeaders := make(map[uint32]struct{}, len(t.pendingEpochStartHeaders))
+	for epoch := range t.pendingEpochStartHeaders {
+		pendingHeaders[epoch] = struct{}{}
+	}
+
+	return pending, pendingHeaders
+}
+
+func (t *trigger) markPendingProofRequested(key string, epoch uint32) bool {
+	t.mutPendingEpochStartData.Lock()
+	defer t.mutPendingEpochStartData.Unlock()
+
+	current, found := t.pendingEpochStartProofs[key]
+	if !found || current.epoch != epoch {
+		return false
+	}
+
+	t.nextProofRequestSequence++
+	current.requestSequence = t.nextProofRequestSequence
+	t.pendingEpochStartProofs[key] = current
+	return true
+}
+
+func (t *trigger) hasPendingEpochStartData() bool {
+	t.mutPendingEpochStartData.Lock()
+	defer t.mutPendingEpochStartData.Unlock()
+
+	return len(t.pendingEpochStartProofs) > 0 || len(t.pendingEpochStartHeaders) > 0
+}
+
+func (t *trigger) getPendingProofRetryInterval() time.Duration {
+	t.mutPendingEpochStartData.Lock()
+	defer t.mutPendingEpochStartData.Unlock()
+
+	return t.pendingProofRetryInterval
+}
+
+// requestPendingEpochStartProofs re-requests proofs for pending epoch-start meta headers,
+// independently of metablock traffic; dormant while there is nothing pending
+func (t *trigger) requestPendingEpochStartProofs(ctx context.Context) {
+	// created stopped; armed only when pending work appears
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
+	defer timer.Stop()
+
+	timerActive := false
+	for {
+		select {
+		case <-ctx.Done():
+			log.Debug("requestPendingEpochStartProofs: trigger's go routine is stopping...")
+			return
+		case <-t.chanPendingEpochStartData:
+			// the callback already sent the immediate request; first retry is due one interval later
+			if !timerActive {
+				timer.Reset(t.getPendingProofRetryInterval())
+				timerActive = true
+			}
+		case <-timer.C:
+			// ctx.Done may be ready in the same select round; do not run a pass after cancellation
+			if ctx.Err() != nil {
+				log.Debug("requestPendingEpochStartProofs: trigger's go routine is stopping...")
+				return
+			}
+			timerActive = false
+			if t.retryPendingEpochStartProofs() {
+				timer.Reset(t.getPendingProofRetryInterval())
+				timerActive = true
+			}
+		}
+	}
+}
+
+// retryPendingEpochStartProofs runs one retry pass and returns true if entries remain pending
+func (t *trigger) retryPendingEpochStartProofs() bool {
+	currentEpoch := t.Epoch()
+	pendingProofs, pendingHeaders := t.pendingEpochStartDataSnapshot()
+	proofRequests := make([]struct {
+		key  string
+		info pendingEpochStartProof
+	}, 0, len(pendingProofs))
+
+	for key, info := range pendingProofs {
+		epoch := info.epoch
+		if epoch <= currentEpoch {
+			t.removePendingEpochStartProof(key, epoch)
+			continue
+		}
+
+		metaBlockHash := []byte(key)
+		header, err := t.headersPool.GetHeaderByHash(metaBlockHash)
+		if err != nil || check.IfNil(header) {
+			t.movePendingProofToHeaderRecovery(key, epoch)
+
+			// Close the race in which the header returned between the failed lookup and the
+			// state transition; duplicate pool insertion would not invoke receivedMetaBlock.
+			header, err = t.headersPool.GetHeaderByHash(metaBlockHash)
+			if err == nil && !check.IfNil(header) {
+				t.addPendingEpochStartProof(metaBlockHash, epoch)
+				continue
+			}
+
+			t.requestHandler.RequestStartOfEpochMetaBlock(epoch)
+			continue
+		}
+
+		_, err = t.proofsPool.GetProof(core.MetachainShardId, metaBlockHash)
+		if err != nil {
+			proofRequests = append(proofRequests, struct {
+				key  string
+				info pendingEpochStartProof
+			}{key: key, info: info})
+			continue
+		}
+
+		t.processMetaHeaderWithProof(header, metaBlockHash)
+		t.removePendingEpochStartProof(key, epoch)
+		t.removePendingEpochStartHeader(epoch)
+	}
+
+	sort.Slice(proofRequests, func(i, j int) bool {
+		if proofRequests[i].info.requestSequence == proofRequests[j].info.requestSequence {
+			return proofRequests[i].key < proofRequests[j].key
+		}
+
+		return proofRequests[i].info.requestSequence < proofRequests[j].info.requestSequence
+	})
+
+	numRequests := min(len(proofRequests), maxPendingProofRequestsPerPass)
+	for _, proofRequest := range proofRequests[:numRequests] {
+		if !t.markPendingProofRequested(proofRequest.key, proofRequest.info.epoch) {
+			continue
+		}
+
+		// stamp the target epoch: the requester drops requests labeled before Andromeda activation
+		t.requestHandler.RequestEquivalentProofByHashForEpoch(core.MetachainShardId, []byte(proofRequest.key), proofRequest.info.epoch)
+	}
+
+	for epoch := range pendingHeaders {
+		if epoch <= currentEpoch {
+			t.removePendingEpochStartHeader(epoch)
+			continue
+		}
+
+		t.requestHandler.RequestStartOfEpochMetaBlock(epoch)
+	}
+
+	return t.hasPendingEpochStartData()
+}
+
+// receivedMetaBlock is a callback function when a new metablock was received
+// upon receiving checks if trigger can be updated
+func (t *trigger) receivedMetaBlock(headerHandler data.HeaderHandler, metaBlockHash []byte) {
+	if headerHandler.GetShardID() != core.MetachainShardId {
+		return
+	}
+
+	select {
+	case t.chanMetaBlockReceived <- struct{}{}:
+	default:
+	}
+
+	log.Debug("received meta header in trigger", "header hash", metaBlockHash)
+	if t.enableEpochsHandler.IsFlagEnabledInEpoch(common.AndromedaFlag, headerHandler.GetEpoch()) {
+		proof, err := t.proofsPool.GetProof(headerHandler.GetShardID(), metaBlockHash)
+		if err != nil {
+			metaHdr, ok := headerHandler.(data.MetaHeaderHandler)
+			if ok && metaHdr.IsStartOfEpochBlock() && metaHdr.GetEpoch() > t.Epoch() {
+				log.Debug("proof not found for epoch start meta header, requesting it",
+					"header hash", metaBlockHash,
+					"epoch", headerHandler.GetEpoch(),
+				)
+				// record before requesting, so a fast response cannot complete unpended
+				t.addPendingEpochStartProof(metaBlockHash, metaHdr.GetEpoch())
+				// stamp the target epoch: the requester drops requests labeled before Andromeda activation
+				go t.requestHandler.RequestEquivalentProofByHashForEpoch(core.MetachainShardId, metaBlockHash, metaHdr.GetEpoch())
+			}
+			return
+		}
+
+		t.removePendingEpochStartHeader(headerHandler.GetEpoch())
+		t.processMetaHeaderWithProof(headerHandler, proof.GetHeaderHash())
+		return
+	}
+
+	t.mutTrigger.Lock()
+	defer t.mutTrigger.Unlock()
+
+	t.checkMetaHeaderForEpochTriggerLegacy(headerHandler, metaBlockHash)
+}
+
+func (t *trigger) checkMetaHeaderForEpochTriggerEquivalentProofs(headerHandler data.HeaderHandler, metaBlockHash []byte) {
+	metaHdr, ok := headerHandler.(data.MetaHeaderHandler)
+	if !ok {
+		return
+	}
+
+	log.Debug("trigger.checkMetaHeaderForEpochTriggerEquivalentProofs", "metaHdr epoch", metaHdr.GetEpoch(), "metaBlockHash", metaBlockHash)
+	if !t.shouldUpdateTrigger(metaHdr, metaBlockHash) {
+		return
+	}
+
+	log.Debug("trigger.updateTriggerHeaderData")
+	t.updateTriggerHeaderData(metaHdr, metaBlockHash)
+	t.updateTriggerFromMeta()
+}
+
+func (t *trigger) checkMetaHeaderForEpochTriggerLegacy(headerHandler data.HeaderHandler, metaBlockHash []byte) {
+	metaHdr, ok := headerHandler.(data.MetaHeaderHandler)
+	if !ok {
+		return
+	}
+
+	if !t.isPreviousEpochStartMetaBlock(metaHdr, metaBlockHash) {
+		_, ok = t.mapFinalizedEpochs[metaHdr.GetEpoch()]
+		if t.metaEpoch == headerHandler.GetEpoch() && ok {
+			t.changeEpochFinalityAttestingRoundIfNeeded(metaHdr, metaBlockHash)
+			return
+		}
+	}
+
+	if !t.shouldUpdateTrigger(metaHdr, metaBlockHash) {
+		return
+	}
+
+	t.updateTriggerHeaderData(metaHdr, metaBlockHash)
+	t.updateTriggerFromMeta()
+}
+
+func (t *trigger) shouldUpdateTrigger(metaHdr data.MetaHeaderHandler, metaBlockHash []byte) bool {
+	if !t.newEpochHdrReceived && !metaHdr.IsStartOfEpochBlock() {
+		return false
+	}
+
+	isMetaStartOfEpochForCurrentOrOlderEpoch := metaHdr.GetEpoch() <= t.epoch && metaHdr.IsStartOfEpochBlock()
+	if isMetaStartOfEpochForCurrentOrOlderEpoch {
+		return false
+	}
+
+	_, foundHdrInMap := t.mapHashHdr[string(metaBlockHash)]
+	_, foundHdrInEpochStartMap := t.mapEpochStartHdrs[string(metaBlockHash)]
+
+	finalizedMetaBlockHash, ok := t.mapFinalizedEpochs[metaHdr.GetEpoch()]
+	foundHdrInFinalizedMap := ok && bytes.Equal(metaBlockHash, []byte(finalizedMetaBlockHash))
+
+	if foundHdrInMap && foundHdrInEpochStartMap && foundHdrInFinalizedMap {
+		return false
+	}
+
+	return true
+}
+
+func (t *trigger) updateTriggerHeaderData(metaHdr data.MetaHeaderHandler, metaBlockHash []byte) {
+	if metaHdr.IsStartOfEpochBlock() {
+		t.newEpochHdrReceived = true
+		t.mapEpochStartHdrs[string(metaBlockHash)] = metaHdr
+		// waiting for late broadcast of mini blocks and transactions to be done and received
+		wait := t.getExtraDelayForRequestsBlockInfo()
+		roundDifferences := t.roundHandler.Index() - int64(metaHdr.GetRound())
+		if roundDifferences > 1 {
+			wait = 0
+		}
+
+		log.Debug("updateTriggerHeaderData: waiting for late broadcast of mini blocks and transactions",
+			"wait time", wait,
+		)
+
+		time.Sleep(wait)
+	}
+
+	t.mapHashHdr[string(metaBlockHash)] = metaHdr
+	t.mapNonceHashes[metaHdr.GetNonce()] = append(t.mapNonceHashes[metaHdr.GetNonce()], string(metaBlockHash))
+}
+
+// call only if mutex is locked before
+func (t *trigger) isPreviousEpochStartMetaBlock(metaBlock data.MetaHeaderHandler, metaBlockHash []byte) bool {
+	metaHdrHashesWithNonce := t.mapNonceHashes[metaBlock.GetNonce()+1]
+	for _, hash := range metaHdrHashesWithNonce {
+		epochStartMetaBlock, ok := t.mapEpochStartHdrs[hash]
+		if !ok {
+			continue
+		}
+		if !bytes.Equal(metaBlockHash, epochStartMetaBlock.GetPrevHash()) {
+			continue
+		}
+
+		return true
+	}
+
+	return false
+}
+
+// call only if mutex is locked before
+func (t *trigger) updateTriggerFromMeta() {
+	sortedMetaInfo := make(metaInfoSlice, 0, len(t.mapEpochStartHdrs))
+	for hash, hdr := range t.mapEpochStartHdrs {
+		if _, ok := t.mapFinalizedEpochs[hdr.GetEpoch()]; ok {
+			continue
+		}
+
+		currMetaInfo := &metaInfo{
+			hdr:  hdr,
+			hash: hash,
+		}
+		sortedMetaInfo = append(sortedMetaInfo, currMetaInfo)
+	}
+
+	sort.Sort(sortedMetaInfo)
+
+	for _, currMetaInfo := range sortedMetaInfo {
+		if _, ok := t.mapFinalizedEpochs[currMetaInfo.hdr.GetEpoch()]; ok {
+			continue
+		}
+
+		canActivateEpochStart, finalityAttestingRound := t.checkIfTriggerCanBeActivated(currMetaInfo.hash, currMetaInfo.hdr)
+		log.Debug("trigger.updateTriggerFromMeta", "canActivateEpochStart", canActivateEpochStart, "finalityAttestingRound", finalityAttestingRound)
+		if canActivateEpochStart && t.metaEpoch < currMetaInfo.hdr.GetEpoch() {
+			t.metaEpoch = currMetaInfo.hdr.GetEpoch()
+			t.isEpochStart = true
+			t.epochStartRound = currMetaInfo.hdr.GetRound()
+			t.epochFinalityAttestingRound = finalityAttestingRound
+			t.epochMetaBlockHash = []byte(currMetaInfo.hash)
+			t.epochStartMeta = currMetaInfo.hdr
+			t.saveCurrentState(currMetaInfo.hdr.GetRound())
+			t.epochStartNotifier.NotifyEpochChangeConfirmed(t.metaEpoch)
+
+			msg := fmt.Sprintf("EPOCH %d BEGINS IN ROUND (%d)", t.metaEpoch, t.epochStartRound)
+			log.Debug(display.Headline(msg, "", "#"))
+			log.Debug("trigger.updateTriggerFromMeta", "isEpochStart", t.isEpochStart)
+			logger.SetCorrelationEpoch(t.metaEpoch)
+			t.clearMissingMiniBlocksMap(t.metaEpoch)
+			t.clearMissingValidatorsInfoMap(t.metaEpoch)
+		}
+
+		// save all final-valid epoch start blocks
+		if canActivateEpochStart {
+			t.mapFinalizedEpochs[currMetaInfo.hdr.GetEpoch()] = currMetaInfo.hash
+			t.saveEpochStartMeta(currMetaInfo.hdr)
+		}
+	}
+}
+
+func (t *trigger) saveEpochStartMeta(metaHdr data.HeaderHandler) {
+	if check.IfNil(metaHdr) {
+		return
+	}
+
+	epochStartIdentifier := core.EpochStartIdentifier(metaHdr.GetEpoch())
+
+	metaBuff, err := t.marshaller.Marshal(metaHdr)
+	if err != nil {
+		log.Debug("updateTriggerFromMeta marshal", "error", err.Error())
+		return
+	}
+
+	err = t.metaHdrStorage.Put([]byte(epochStartIdentifier), metaBuff)
+	if err != nil {
+		log.Debug("updateTriggerMeta put into metaHdrStorage", "error", err.Error())
+	}
+
+	err = t.triggerStorage.Put([]byte(epochStartIdentifier), metaBuff)
+	if err != nil {
+		log.Debug("updateTriggerMeta put into triggerStorage", "error", err.Error())
+	}
+}
+
+// call only if mutex is locked before
+func (t *trigger) isMetaBlockValid(hash string, metaHdr data.HeaderHandler) bool {
+	currHdr := metaHdr
+	for i := metaHdr.GetNonce() - 1; i >= metaHdr.GetNonce()-t.validity; i-- {
+		neededHdr, err := t.getHeaderWithNonceAndHash(i, currHdr.GetPrevHash())
+		if err != nil {
+			log.Debug("isMetaBlockValid.getHeaderWithNonceAndHash", "hash", hash, "error", err.Error())
+			return false
+		}
+
+		err = t.headerValidator.IsHeaderConstructionValid(currHdr, neededHdr)
+		if err != nil {
+			log.Debug("isMetaBlockValid.IsHeaderConstructionValid", "hash", hash, "error", err.Error())
+			return false
+		}
+
+		currHdr = neededHdr
+	}
+
+	return true
+}
+
+func (t *trigger) isMetaBlockFinal(hash string, metaHdr data.HeaderHandler) (bool, uint64) {
+	if !t.enableEpochsHandler.IsFlagEnabledInEpoch(common.AndromedaFlag, metaHdr.GetEpoch()) {
+		return t.isMetaBlockFinalLegacy(hash, metaHdr)
+	}
+
+	// under Supernova a contended epoch start must not
+	// activate the trigger until the node holds it final
+	if t.enableEpochsHandler.IsFlagEnabledInEpoch(common.SupernovaFlag, metaHdr.GetEpoch()) {
+		if !t.metaFinalityView.IsMetaHeaderHeldFinal(metaHdr, []byte(hash)) {
+			return false, 0
+		}
+
+		return true, metaHdr.GetRound()
+	}
+
+	hasProof := t.proofsPool.HasProof(metaHdr.GetShardID(), []byte(hash))
+	if !hasProof {
+		return false, 0
+	}
+
+	return true, metaHdr.GetRound()
+}
+
+func (t *trigger) isMetaBlockFinalLegacy(_ string, metaHdr data.HeaderHandler) (bool, uint64) {
+	nextBlocksVerified := uint64(0)
+	finalityAttestingRound := metaHdr.GetRound()
+	currHdr := metaHdr
+
+	for nonce := metaHdr.GetNonce() + 1; nonce <= metaHdr.GetNonce()+t.finality; nonce++ {
+		currHash, err := core.CalculateHash(t.marshaller, t.hasher, currHdr)
+		if err != nil {
+			continue
+		}
+
+		neededHdr, err := t.getHeaderWithNonceAndPrevHash(nonce, currHash)
+		if err != nil {
+			continue
+		}
+
+		currHdr = neededHdr
+
+		finalityAttestingRound = currHdr.GetRound()
+		nextBlocksVerified += 1
+	}
+
+	if nextBlocksVerified < t.finality {
+		log.Debug("isMetaBlockFinal", "nextBlocksVerified", nextBlocksVerified, "finality", t.finality)
+		for nonce := currHdr.GetNonce() + 1; nonce <= currHdr.GetNonce()+t.finality; nonce++ {
+			go t.requestHandler.RequestMetaHeaderByNonce(nonce)
+		}
+		return false, 0
+	}
+
+	return true, finalityAttestingRound
+}
+
+// call only if mutex is locked before
+func (t *trigger) checkIfTriggerCanBeActivated(hash string, metaHdr data.HeaderHandler) (bool, uint64) {
+	isMetaHdrValid := t.isMetaBlockValid(hash, metaHdr)
+	if !isMetaHdrValid {
+		return false, 0
+	}
+
+	missingMiniBlocksHashes, blockBody, err := t.peerMiniBlocksSyncer.SyncMiniBlocks(metaHdr)
+	if err != nil {
+		t.addMissingMiniBlocks(metaHdr.GetEpoch(), missingMiniBlocksHashes)
+		log.Debug("checkIfTriggerCanBeActivated.SyncMiniBlocks", "num missing mini blocks", len(missingMiniBlocksHashes), "error", err)
+		return false, 0
+	}
+
+	if t.enableEpochsHandler.IsFlagEnabledInEpoch(common.RefactorPeersMiniBlocksFlag, metaHdr.GetEpoch()) {
+		missingValidatorsInfoHashes, validatorsInfo, err := t.peerMiniBlocksSyncer.SyncValidatorsInfo(blockBody)
+		if err != nil {
+			t.addMissingValidatorsInfo(metaHdr.GetEpoch(), missingValidatorsInfoHashes)
+			log.Debug("checkIfTriggerCanBeActivated.SyncValidatorsInfo", "num missing validators info", len(missingValidatorsInfoHashes), "error", err)
+			return false, 0
+		}
+
+		for validatorInfoHash, validatorInfo := range validatorsInfo {
+			t.currentEpochValidatorInfoPool.AddValidatorInfo([]byte(validatorInfoHash), validatorInfo)
+		}
+	}
+
+	if _, alreadyPrepared := t.mapPreparedEpochStartHdrs[hash]; !alreadyPrepared {
+		t.epochStartNotifier.NotifyAllPrepare(metaHdr, blockBody)
+		t.mapPreparedEpochStartHdrs[hash] = struct{}{}
+	}
+
+	isMetaHdrFinal, finalityAttestingRound := t.isMetaBlockFinal(hash, metaHdr)
+	return isMetaHdrFinal, finalityAttestingRound
+}
+
+func (t *trigger) addMissingMiniBlocks(epoch uint32, missingMiniBlocksHashes [][]byte) {
+	t.mutMissingMiniBlocks.Lock()
+	defer t.mutMissingMiniBlocks.Unlock()
+
+	for _, hash := range missingMiniBlocksHashes {
+		t.mapMissingMiniBlocks[string(hash)] = epoch
+		log.Debug("trigger.addMissingMiniBlocks", "epoch", epoch, "hash", hash)
+	}
+}
+
+func (t *trigger) addMissingValidatorsInfo(epoch uint32, missingValidatorsInfoHashes [][]byte) {
+	t.mutMissingValidatorsInfo.Lock()
+	defer t.mutMissingValidatorsInfo.Unlock()
+
+	for _, hash := range missingValidatorsInfoHashes {
+		t.mapMissingValidatorsInfo[string(hash)] = epoch
+		log.Debug("trigger.addMissingValidatorsInfo", "epoch", epoch, "hash", hash)
+	}
+}
+
+// call only if mutex is locked before
+func (t *trigger) getHeaderWithNonceAndHashFromMaps(nonce uint64, neededHash []byte) data.HeaderHandler {
+	metaHdrHashesWithNonce := t.mapNonceHashes[nonce]
+	for _, hash := range metaHdrHashesWithNonce {
+		if !bytes.Equal(neededHash, []byte(hash)) {
+			continue
+		}
+
+		neededHdr := t.mapHashHdr[hash]
+		if !check.IfNil(neededHdr) {
+			return neededHdr
+		}
+	}
+
+	return nil
+}
+
+// call only if mutex is locked before
+func (t *trigger) getHeaderWithHashFromPool(neededHash []byte) data.HeaderHandler {
+	peekedData, _ := t.headersPool.GetHeaderByHash(neededHash)
+	neededHdr, ok := peekedData.(data.MetaHeaderHandler)
+	if ok {
+		t.mapHashHdr[string(neededHash)] = neededHdr
+		t.mapNonceHashes[neededHdr.GetNonce()] = append(t.mapNonceHashes[neededHdr.GetNonce()], string(neededHash))
+		return neededHdr
+	}
+
+	return nil
+}
+
+// call only if mutex is locked before
+func (t *trigger) getHeaderWithHashFromStorage(neededHash []byte) data.HeaderHandler {
+	storageData, err := t.metaHdrStorage.Get(neededHash)
+	if err == nil {
+		neededHdr, err := process.UnmarshalMetaHeader(t.marshaller, storageData)
+		if err == nil {
+			t.mapHashHdr[string(neededHash)] = neededHdr
+			t.mapNonceHashes[neededHdr.GetNonce()] = append(t.mapNonceHashes[neededHdr.GetNonce()], string(neededHash))
+			return neededHdr
+		}
+	}
+
+	return nil
+}
+
+// call only if mutex is locked before
+func (t *trigger) getHeaderWithNonceAndHash(nonce uint64, neededHash []byte) (data.HeaderHandler, error) {
+	metaHdr := t.getHeaderWithNonceAndHashFromMaps(nonce, neededHash)
+	if !check.IfNil(metaHdr) {
+		return metaHdr, nil
+	}
+
+	metaHdr = t.getHeaderWithHashFromPool(neededHash)
+	if !check.IfNil(metaHdr) {
+		return metaHdr, nil
+	}
+
+	metaHdr = t.getHeaderWithHashFromStorage(neededHash)
+	if !check.IfNil(metaHdr) {
+		return metaHdr, nil
+	}
+
+	go t.requestHandler.RequestMetaHeader(neededHash)
+
+	return nil, epochStart.ErrMetaHdrNotFound
+}
+
+// call only if mutex is locked before
+func (t *trigger) getHeaderWithNonceAndPrevHashFromMaps(nonce uint64, prevHash []byte) data.HeaderHandler {
+	lowestRound := uint64(math.MaxUint64)
+	var chosenMeta data.HeaderHandler = &block.MetaBlock{}
+
+	metaHdrHashesWithNonce := t.mapNonceHashes[nonce]
+	for _, hash := range metaHdrHashesWithNonce {
+		hdrWithNonce := t.mapHashHdr[hash]
+		if check.IfNil(hdrWithNonce) {
+			continue
+		}
+		if !bytes.Equal(hdrWithNonce.GetPrevHash(), prevHash) {
+			continue
+		}
+
+		if lowestRound > hdrWithNonce.GetRound() {
+			lowestRound = hdrWithNonce.GetRound()
+			chosenMeta = hdrWithNonce
+		}
+	}
+
+	if lowestRound == uint64(math.MaxUint64) {
+		return nil
+	}
+
+	return chosenMeta
+}
+
+// call only if mutex is locked before
+func (t *trigger) getHeaderWithNonceAndPrevHashFromCache(nonce uint64, prevHash []byte) data.HeaderHandler {
+	headers, hashes, err := t.headersPool.GetHeadersByNonceAndShardId(nonce, core.MetachainShardId)
+	if err != nil {
+		return nil
+	}
+
+	lowestRound := uint64(math.MaxUint64)
+	var chosenMeta data.MetaHeaderHandler
+	for i, header := range headers {
+		if !bytes.Equal(header.GetPrevHash(), prevHash) {
+			continue
+		}
+
+		hdrWithNonce, ok := header.(data.MetaHeaderHandler)
+		if !ok {
+			continue
+		}
+
+		if lowestRound > hdrWithNonce.GetRound() {
+			lowestRound = hdrWithNonce.GetRound()
+			chosenMeta = hdrWithNonce
+		}
+
+		t.mapHashHdr[string(hashes[i])] = hdrWithNonce
+		t.mapNonceHashes[hdrWithNonce.GetNonce()] = append(t.mapNonceHashes[hdrWithNonce.GetNonce()], string(hashes[i]))
+	}
+
+	if lowestRound == uint64(math.MaxUint64) {
+		return nil
+	}
+
+	return chosenMeta
+}
+
+// call only if mutex is locked before
+func (t *trigger) getHeaderWithNonceAndPrevHash(nonce uint64, prevHash []byte) (data.HeaderHandler, error) {
+	metaHdr := t.getHeaderWithNonceAndPrevHashFromMaps(nonce, prevHash)
+	if !check.IfNil(metaHdr) {
+		return metaHdr, nil
+	}
+
+	metaHdr = t.getHeaderWithNonceAndPrevHashFromCache(nonce, prevHash)
+	if !check.IfNil(metaHdr) {
+		return metaHdr, nil
+	}
+
+	return nil, epochStart.ErrMetaHdrNotFound
+}
+
+func (t *trigger) getAllFinishedStartOfEpochMetaHdrs() []data.HeaderHandler {
+	finishedMetaHdrs := make([]data.HeaderHandler, 0, len(t.mapFinalizedEpochs))
+	for _, hash := range t.mapFinalizedEpochs {
+		metaHdr := t.mapEpochStartHdrs[hash]
+		finishedMetaHdrs = append(finishedMetaHdrs, metaHdr)
+	}
+	return finishedMetaHdrs
+}
+
+// SetProcessed sets start of epoch to false and cleans underlying structure
+func (t *trigger) SetProcessed(header data.HeaderHandler, _ data.BodyHandler) {
+	t.mutTrigger.Lock()
+	defer t.mutTrigger.Unlock()
+
+	shardHdr, ok := header.(data.ShardHeaderHandler)
+	if !ok {
+		return
+	}
+
+	if !shardHdr.IsStartOfEpochBlock() {
+		return
+	}
+
+	t.appStatusHandler.SetUInt64Value(common.MetricRoundAtEpochStart, shardHdr.GetRound())
+	t.appStatusHandler.SetUInt64Value(common.MetricNonceAtEpochStart, shardHdr.GetNonce())
+
+	t.epoch = shardHdr.GetEpoch()
+	if t.metaEpoch < t.epoch {
+		t.metaEpoch = t.epoch
+		t.epochMetaBlockHash = shardHdr.GetEpochStartMetaHash()
+	}
+
+	t.isEpochStart = false
+	t.newEpochHdrReceived = false
+	t.epochStartShardHeader = shardHdr
+	finishedStartOfEpochMetaHdrs := t.getAllFinishedStartOfEpochMetaHdrs()
+
+	t.epochStartNotifier.NotifyAll(shardHdr)
+
+	t.mapHashHdr = make(map[string]data.HeaderHandler)
+	t.mapNonceHashes = make(map[uint64][]string)
+	t.mapEpochStartHdrs = make(map[string]data.HeaderHandler)
+	t.mapFinalizedEpochs = make(map[uint32]string)
+	t.mapPreparedEpochStartHdrs = make(map[string]struct{})
+
+	t.saveCurrentState(header.GetRound())
+
+	log.Debug("trigger.SetProcessed", "isEpochStart", t.isEpochStart)
+
+	shardHdrBuff, errNotCritical := t.marshaller.Marshal(shardHdr)
+	if errNotCritical != nil {
+		log.Warn("SetProcessed marshal error", "error", errNotCritical)
+	}
+
+	epochStartIdentifier := core.EpochStartIdentifier(shardHdr.GetEpoch())
+	errNotCritical = t.shardHdrStorage.Put([]byte(epochStartIdentifier), shardHdrBuff)
+	if errNotCritical != nil {
+		logLevel := logger.LogWarning
+		if core.IsClosingError(errNotCritical) {
+			logLevel = logger.LogDebug
+		}
+		log.Log(logLevel, "SetProcessed put to shard header storage error", "error", errNotCritical)
+	}
+
+	// save finished start of epoch meta hdrs to current storage
+	for _, metaHdr := range finishedStartOfEpochMetaHdrs {
+		t.saveEpochStartMeta(metaHdr)
+	}
+}
+
+// RevertStateToBlock will revert the state of the trigger to the current block
+func (t *trigger) RevertStateToBlock(header data.HeaderHandler) error {
+	if check.IfNil(header) {
+		return epochStart.ErrNilHeaderHandler
+	}
+
+	t.mutTrigger.Lock()
+	defer t.mutTrigger.Unlock()
+
+	currentHeaderHash, err := core.CalculateHash(t.marshaller, t.hasher, header)
+	if err != nil {
+		log.Warn("RevertStateToBlock error on hashing", "error", err)
+		return err
+	}
+
+	if !bytes.Equal(t.epochStartShardHeader.GetPrevHash(), currentHeaderHash) {
+		return nil
+	}
+
+	log.Debug("trigger.RevertStateToBlock behind start of epoch block")
+
+	// the revert target's epoch start block is necessarily its stored ancestor: skipped empty
+	// epochs resolve exactly, and a miss means corruption that fabricated state would hide
+	prevEpoch := header.GetEpoch()
+	if prevEpoch == 0 {
+		t.epochStartShardHeader = &block.Header{}
+		t.isEpochStart = true
+		t.newEpochHdrReceived = true
+		log.Debug("trigger.RevertStateToBlock", "isEpochStart", t.isEpochStart)
+
+		return nil
+	}
+
+	prevEpochStartIdentifier := core.EpochStartIdentifier(prevEpoch)
+	shardHdrBuff, err := t.shardHdrStorage.SearchFirst([]byte(prevEpochStartIdentifier))
+	if err != nil {
+		log.Warn("RevertStateToBlock previous epoch start header not found", "epoch", prevEpoch, "err", err)
+		return err
+	}
+
+	shardHdr, err := process.UnmarshalShardHeader(t.marshaller, shardHdrBuff)
+	if err != nil {
+		log.Warn("RevertStateToBlock unmarshal error", "err", err)
+		return err
+	}
+
+	epochStartIdentifier := core.EpochStartIdentifier(t.epochStartShardHeader.GetEpoch())
+	errNotCritical := t.shardHdrStorage.Remove([]byte(epochStartIdentifier))
+	if errNotCritical != nil {
+		log.Warn("RevertStateToBlock remove from header storage error", "err", errNotCritical)
+	}
+
+	t.epochStartShardHeader = shardHdr
+	t.isEpochStart = true
+	t.newEpochHdrReceived = true
+	log.Debug("trigger.RevertStateToBlock", "isEpochStart", t.isEpochStart)
+
+	return nil
+}
+
+// DisarmDeadEpochStartActivation reverts an activation armed by a dead epoch start meta block so
+// the canonical sibling can re-arm; covers received-time arming only. Returns true if disarmed.
+func (t *trigger) DisarmDeadEpochStartActivation(epoch uint32, deadEpochStartHash []byte) bool {
+	t.mutTrigger.Lock()
+	defer t.mutTrigger.Unlock()
+
+	finalizedHash, ok := t.mapFinalizedEpochs[epoch]
+	if !ok || finalizedHash != string(deadEpochStartHash) {
+		return false
+	}
+
+	log.Warn("trigger.DisarmDeadEpochStartActivation",
+		"epoch", epoch,
+		"dead epoch start hash", deadEpochStartHash,
+	)
+
+	delete(t.mapFinalizedEpochs, epoch)
+	t.forgetEpochStartHeader(deadEpochStartHash)
+	t.removeStoredEpochStartMeta(epoch)
+
+	if bytes.Equal(t.epochMetaBlockHash, deadEpochStartHash) {
+		t.restorePreActivationState()
+	}
+
+	err := t.saveState(t.triggerStateKey)
+	if err != nil {
+		log.Warn("DisarmDeadEpochStartActivation saveState", "error", err)
+	}
+
+	return true
+}
+
+// call only if mutex is locked before
+func (t *trigger) forgetEpochStartHeader(hash []byte) {
+	hdr := t.mapHashHdr[string(hash)]
+	delete(t.mapEpochStartHdrs, string(hash))
+	delete(t.mapHashHdr, string(hash))
+	if check.IfNil(hdr) {
+		return
+	}
+
+	hashes := t.mapNonceHashes[hdr.GetNonce()]
+	remaining := make([]string, 0, len(hashes))
+	for _, current := range hashes {
+		if current == string(hash) {
+			continue
+		}
+
+		remaining = append(remaining, current)
+	}
+
+	if len(remaining) == 0 {
+		delete(t.mapNonceHashes, hdr.GetNonce())
+		return
+	}
+
+	t.mapNonceHashes[hdr.GetNonce()] = remaining
+}
+
+// call only if mutex is locked before
+func (t *trigger) removeStoredEpochStartMeta(epoch uint32) {
+	epochStartIdentifier := []byte(core.EpochStartIdentifier(epoch))
+	errNotCritical := t.metaHdrStorage.Remove(epochStartIdentifier)
+	if errNotCritical != nil {
+		log.Debug("removeStoredEpochStartMeta metaHdrStorage remove", "error", errNotCritical)
+	}
+
+	errNotCritical = t.triggerStorage.Remove(epochStartIdentifier)
+	if errNotCritical != nil {
+		log.Debug("removeStoredEpochStartMeta triggerStorage remove", "error", errNotCritical)
+	}
+}
+
+// call only if mutex is locked before
+func (t *trigger) restorePreActivationState() {
+	t.metaEpoch = t.epoch
+	t.isEpochStart = false
+
+	t.epochMetaBlockHash = nil
+	shardHdr, ok := t.epochStartShardHeader.(data.ShardHeaderHandler)
+	if ok && len(shardHdr.GetEpochStartMetaHash()) > 0 {
+		t.epochMetaBlockHash = shardHdr.GetEpochStartMetaHash()
+	}
+
+	epochStartIdentifier := []byte(core.EpochStartIdentifier(t.epoch))
+	metaBuff, err := t.metaHdrStorage.SearchFirst(epochStartIdentifier)
+	if err != nil {
+		log.Debug("restorePreActivationState epoch start meta not in storage", "epoch", t.epoch, "error", err)
+		return
+	}
+
+	prevStartMeta, err := process.UnmarshalMetaHeader(t.marshaller, metaBuff)
+	if err != nil {
+		log.Warn("restorePreActivationState unmarshal", "error", err)
+		return
+	}
+
+	t.epochStartMeta = prevStartMeta
+	t.epochStartRound = prevStartMeta.GetRound()
+	t.epochFinalityAttestingRound = prevStartMeta.GetRound()
+}
+
+// EpochStartMetaHdrHash returns the announcing meta header hash which created the new epoch
+func (t *trigger) EpochStartMetaHdrHash() []byte {
+	t.mutTrigger.RLock()
+	defer t.mutTrigger.RUnlock()
+
+	return t.epochMetaBlockHash
+}
+
+// LastCommitedEpochStartHdr returns the epoch start header
+func (t *trigger) LastCommitedEpochStartHdr() (data.HeaderHandler, error) {
+	t.mutTrigger.RLock()
+	defer t.mutTrigger.RUnlock()
+
+	// marshal + unmarshal deep copy
+	headerBytes, err := t.marshaller.Marshal(t.epochStartShardHeader)
+	if err != nil {
+		return nil, err
+	}
+
+	return process.UnmarshalShardHeader(t.marshaller, headerBytes)
+}
+
+// GetEpochStartHdrFromStorage returns the epoch start header from storage
+func (t *trigger) GetEpochStartHdrFromStorage(epoch uint32) (data.HeaderHandler, error) {
+	epochStartIdentifier := core.EpochStartIdentifier(epoch)
+	shardHdrBuff, err := t.shardHdrStorage.SearchFirst([]byte(epochStartIdentifier))
+	if err != nil {
+		log.Warn("GetEpochStartHdrFromStorage search first", "epoch", epoch, "identifier", epochStartIdentifier, "error", err)
+		return nil, err
+	}
+
+	return process.UnmarshalShardHeader(t.marshaller, shardHdrBuff)
+}
+
+// GetSavedStateKey returns the last saved trigger state key
+func (t *trigger) GetSavedStateKey() []byte {
+	return t.triggerStateKey
+}
+
+// Update updates the end-of-epoch trigger
+func (t *trigger) Update(_ uint64, _ uint64) {
+}
+
+// SetEpochChange will do nothing
+func (t *trigger) SetEpochChange(_ uint64) {
+}
+
+// ShouldProposeEpochChange will always return false
+func (t *trigger) ShouldProposeEpochChange(_ uint64, _ uint64) bool {
+	return false
+}
+
+// SetEpochChangeProposed will do nothing
+func (t *trigger) SetEpochChangeProposed(_ bool) {
+	// no implementation needed
+}
+
+// GetEpochChangeProposed will always return false
+func (t *trigger) GetEpochChangeProposed() bool {
+	return false
+}
+
+// SetFinalityAttestingRound sets the round which finalized the start of epoch block
+func (t *trigger) SetFinalityAttestingRound(_ uint64) {
+}
+
+// SetCurrentEpochStartRound sets the round when the current epoch started
+func (t *trigger) SetCurrentEpochStartRound(_ uint64) {
+}
+
+// needs to be called under locked mutex
+func (t *trigger) saveCurrentState(round uint64) {
+	t.triggerStateKey = []byte(fmt.Sprint(round))
+	err := t.saveState(t.triggerStateKey)
+	if err != nil {
+		log.Debug("error saving trigger state", "error", err, "key", t.triggerStateKey)
+	}
+}
+
+func (t *trigger) computeWatchdogTimeout() time.Duration {
+	timeout := t.roundHandler.TimeDuration() * numRoundsWithoutReceivedMetaBlocks
+	if timeout <= 0 {
+		return 0
+	}
+	return timeout
+}
+
+func (t *trigger) watchdogRequestEpochStartMetaBlock(ctx context.Context) {
+	watchdogTimeout := t.computeWatchdogTimeout()
+	if watchdogTimeout == 0 {
+		return
+	}
+
+	timer := time.NewTimer(watchdogTimeout)
+	defer timer.Stop()
+
+	resetTimer := func(d time.Duration) {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(d)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Debug("watchdogRequestEpochStartMetaBlock: trigger's go routine is stopping...")
+			return
+		case <-t.chanMetaBlockReceived:
+			resetTimer(t.resetWatchdogTimeout(watchdogTimeout))
+		case <-timer.C:
+			t.handleWatchdogTimeout()
+			resetTimer(t.resetWatchdogTimeout(watchdogTimeout))
+		}
+	}
+}
+
+func (t *trigger) resetWatchdogTimeout(fallback time.Duration) time.Duration {
+	timeout := t.computeWatchdogTimeout()
+	if timeout == 0 {
+		return fallback
+	}
+	return timeout
+}
+
+func (t *trigger) handleWatchdogTimeout() {
+	t.mutTrigger.RLock()
+	epoch := t.epoch
+	isEpochStart := t.isEpochStart
+	t.mutTrigger.RUnlock()
+
+	if isEpochStart {
+		return
+	}
+
+	log.Debug("watchdog: no metablock received for too long, requesting epoch start metablock",
+		"current epoch", epoch,
+		"requesting epoch", epoch+1,
+	)
+	go t.requestHandler.RequestStartOfEpochMetaBlock(epoch + 1)
+}
+
+// Close will close the endless running go routine
+func (t *trigger) Close() error {
+	if t.cancelFunc != nil {
+		t.cancelFunc()
+	}
+
+	return nil
+}
+
+// IsInterfaceNil returns true if underlying object is nil
+func (t *trigger) IsInterfaceNil() bool {
+	return t == nil
+}
