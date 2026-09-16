@@ -1,6 +1,6 @@
 package process
 
-// Guard for the core #7961 defect on the #7962 base: two distinct execution
+// Two distinct execution
 // results sharing one state root must each keep their own state-access batch
 // all the way through the outport provider.
 
@@ -29,15 +29,15 @@ func TestGetStateAccesses_V3DistinctExecutionsWithSameRootAreBothDelivered(t *te
 	executionA := []byte("execution-a-header-hash")
 	executionB := []byte("execution-b-header-hash")
 
-	generation := collector.BeginExecution(executionA)
+	collector.BeginExecution(executionA)
 	collector.AddStateAccess(&stateChange.StateAccess{Type: stateChange.Read, TxHash: []byte("tx-a")})
 	require.NoError(t, collector.CommitCollectedAccesses(sharedRoot))
-	collector.EndExecution(generation)
+	collector.EndExecution(executionA)
 
-	generation = collector.BeginExecution(executionB)
+	collector.BeginExecution(executionB)
 	collector.AddStateAccess(&stateChange.StateAccess{Type: stateChange.Read, TxHash: []byte("tx-b")})
 	require.NoError(t, collector.CommitCollectedAccesses(sharedRoot))
-	collector.EndExecution(generation)
+	collector.EndExecution(executionB)
 
 	arg := createArgOutportDataProvider()
 	arg.StateAccessesCollector = collector

@@ -60,6 +60,9 @@ var ErrWrongTypeAssertion = errors.New("wrong type assertion")
 // ErrAccNotFound signals that account was not found in state trie
 var ErrAccNotFound = errors.New("account was not found")
 
+// ErrAccountAddressIsReserved signals that an account cannot be created at the requested address
+var ErrAccountAddressIsReserved = errors.New("account address is reserved")
+
 // ErrNilOrEmptyDataTrieUpdates signals that there are no data trie updates
 var ErrNilOrEmptyDataTrieUpdates = errors.New("no data trie updates")
 
@@ -190,7 +193,12 @@ type StateAccessesRootMismatchError struct {
 
 // Error returns the root mismatch message
 func (e *StateAccessesRootMismatchError) Error() string {
-	return ErrStateAccessesRootMismatch.Error()
+	return fmt.Sprintf("%s: headerHash = %s, expectedRoot = %s, actualRoot = %s",
+		ErrStateAccessesRootMismatch.Error(),
+		hex.EncodeToString(e.HeaderHash),
+		hex.EncodeToString(e.ExpectedRoot),
+		hex.EncodeToString(e.ActualRoot),
+	)
 }
 
 // Unwrap returns the root mismatch sentinel

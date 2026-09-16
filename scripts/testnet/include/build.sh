@@ -1,6 +1,6 @@
 prepareFolders() {
   [ -d $TESTNETDIR ] || mkdir -p $TESTNETDIR
-  cd $TESTNETDIR
+  cd "$TESTNETDIR" || exit 1
   [ -d filegen ] || mkdir -p filegen
   [ -d node ] || mkdir -p node
   [ -d node/config ] || mkdir -p node/config
@@ -11,14 +11,14 @@ prepareFolders() {
 
 prepareFolders_Proxy() {
   [ -d $TESTNETDIR ] || mkdir -p $TESTNETDIR
-  cd $TESTNETDIR
+  cd "$TESTNETDIR" || exit 1
   [ -d proxy ] || mkdir -p proxy
   [ -d ./proxy/config ] || mkdir -p ./proxy/config
 }
 
 prepareFolders_TxGen() {
   [ -d $TESTNETDIR ] || mkdir -p $TESTNETDIR
-  cd $TESTNETDIR
+  cd "$TESTNETDIR" || exit 1
   [ -d txgen ] || mkdir -p txgen
   [ -d ./txgen/config ] || mkdir -p ./txgen/config
   [ -d ./txgen/config/nodeConfig ] || mkdir -p ./txgen/config/nodeConfig
@@ -42,7 +42,7 @@ buildNode() {
   echo "Building Node executable..."
   pushd $NODEDIR
 
-  APP_VERSION="L2.0.0.0"
+  APP_VERSION="L2.0.8.0"
   if [ $ALWAYS_NEW_APP_VERSION -eq 1 ]; then
     APP_VERSION="$(date +"v%Y.%m.%d.%H.%M.%S")"
   fi
@@ -68,7 +68,7 @@ buildSeednode() {
   popd
 }
 
-buildProxy() {
+buildProxy() {          
   echo "Building Proxy executable..."
   pushd $PROXYDIR
   go build .

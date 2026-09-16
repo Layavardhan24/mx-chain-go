@@ -105,14 +105,14 @@ func TestOutportEndToEnd_CommittedBatchReachesSubscribedDriver(t *testing.T) {
 	headerHash := []byte("block-header-hash")
 	rootHash := []byte("block-root-hash")
 
-	generation := collector.BeginExecution(headerHash)
+	collector.BeginExecution(headerHash)
 	collector.AddStateAccess(&stateChange.StateAccess{
 		Type:        stateChange.Write,
 		TxHash:      []byte("tx-hash"),
 		MainTrieKey: []byte("account-key"),
 	})
 	require.NoError(t, collector.CommitCollectedAccesses(rootHash))
-	collector.EndExecution(generation)
+	collector.EndExecution(headerHash)
 
 	provider := newRealOutportProvider(t, collector)
 

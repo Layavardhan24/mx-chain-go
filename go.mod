@@ -1,6 +1,6 @@
 module github.com/multiversx/mx-chain-go
 
-go 1.26.2
+go 1.26
 
 require (
 	github.com/beevik/ntp v1.3.0
@@ -16,18 +16,18 @@ require (
 	github.com/libp2p/go-libp2p v0.48.0
 	github.com/libp2p/go-libp2p-pubsub v0.16.0
 	github.com/mitchellh/mapstructure v1.5.0
-	github.com/multiversx/mx-chain-communication-go v1.3.3-0.20260813144301-82eeb3f13e41
-	github.com/multiversx/mx-chain-core-go v1.5.1-0.20260721064337-e17a03faa70b
-	github.com/multiversx/mx-chain-crypto-go v1.3.2-0.20260713100639-c3cf05776cb6
-	github.com/multiversx/mx-chain-es-indexer-go v1.10.3-0.20260723124531-43479b3571e7
-	github.com/multiversx/mx-chain-logger-go v1.1.1-0.20260713100530-e85a16be3260
-	github.com/multiversx/mx-chain-scenario-go v1.7.1-0.20260713104347-ca02e230558e
-	github.com/multiversx/mx-chain-storage-go v1.1.2-0.20260713100751-bad800525dbe
-	github.com/multiversx/mx-chain-vm-common-go v1.6.8-0.20260713100832-23aa4c20accd
-	github.com/multiversx/mx-chain-vm-go v1.6.1-0.20260730132401-84511027e57a
-	github.com/multiversx/mx-chain-vm-v1_2-go v1.2.70-0.20260713104734-692938905e51
-	github.com/multiversx/mx-chain-vm-v1_3-go v1.3.71-0.20260713104815-e09ce0effc4a
-	github.com/multiversx/mx-chain-vm-v1_4-go v1.4.100-0.20260713105015-b7543e66e0d5
+	github.com/multiversx/mx-chain-communication-go v1.4.1
+	github.com/multiversx/mx-chain-core-go v1.5.1
+	github.com/multiversx/mx-chain-crypto-go v1.3.3
+	github.com/multiversx/mx-chain-es-indexer-go v1.10.3
+	github.com/multiversx/mx-chain-logger-go v1.2.0
+	github.com/multiversx/mx-chain-scenario-go v1.8.0
+	github.com/multiversx/mx-chain-storage-go v1.2.0
+	github.com/multiversx/mx-chain-vm-common-go v1.7.1
+	github.com/multiversx/mx-chain-vm-go v1.5.49
+	github.com/multiversx/mx-chain-vm-v1_2-go v1.2.70
+	github.com/multiversx/mx-chain-vm-v1_3-go v1.3.71
+	github.com/multiversx/mx-chain-vm-v1_4-go v1.4.100
 	github.com/pelletier/go-toml v1.9.5
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v1.23.2
@@ -126,7 +126,7 @@ require (
 	github.com/multiformats/go-multistream v0.6.1 // indirect
 	github.com/multiformats/go-varint v0.1.0 // indirect
 	github.com/multiversx/concurrent-map v0.1.4 // indirect
-	github.com/multiversx/mx-components-big-int v1.1.1-0.20260507134206-ffc95520dc6d // indirect
+	github.com/multiversx/mx-components-big-int v1.2.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/nsf/termbox-go v0.0.0-20190121233118-02980233997d // indirect
 	github.com/onsi/gomega v1.36.2 // indirect
@@ -198,32 +198,4 @@ require (
 
 replace github.com/gogo/protobuf => github.com/multiversx/protobuf v1.3.2
 
-replace github.com/ipfs/go-log/v2 => github.com/xorewa/go-log/v2 v2.0.0-20260814192827-a7b09db391da
-
-replace github.com/multiversx/mx-chain-core-go => github.com/xorewa/mx-chain-core-go v0.0.0-20260722085155-20cd3d7fe94e
-
-replace github.com/multiversx/mx-chain-logger-go => github.com/xorewa/mx-chain-logger-go v0.0.0-20260714091540-93ee305f126a
-
-replace github.com/multiversx/mx-chain-crypto-go => github.com/xorewa/mx-chain-crypto-go v0.0.0-20260714091410-6a1071ad95d8
-
-replace github.com/multiversx/mx-chain-storage-go => github.com/xorewa/mx-chain-storage-go v0.0.0-20260714091422-a9e4a9bb00bb
-
-replace github.com/multiversx/mx-chain-vm-common-go => github.com/xorewa/mx-chain-vm-common-go v0.0.0-20260714091415-d7dae605cee2
-
-replace github.com/multiversx/mx-chain-communication-go => github.com/xorewa/mx-chain-communication-go v0.0.0-20260814090644-5543dc3df655
-
-replace github.com/multiversx/mx-chain-scenario-go => github.com/xorewa/mx-chain-scenario-go v0.0.0-20260714091510-12f7d86f8c08
-
-replace github.com/multiversx/mx-components-big-int => github.com/xorewa/mx-components-big-int v0.0.0-20260714091456-bf9a7d2e91b1
-
-replace github.com/multiversx/mx-chain-vm-v1_2-go => github.com/xorewa/mx-chain-vm-v1_2-go v0.0.0-20260714091524-e1184b970239
-
-replace github.com/multiversx/mx-chain-vm-v1_3-go => github.com/xorewa/mx-chain-vm-v1_3-go v0.0.0-20260714091530-1df584cec689
-
-replace github.com/multiversx/mx-chain-vm-v1_4-go => github.com/xorewa/mx-chain-vm-v1_4-go v0.0.0-20260714091537-b051efda6999
-
-replace github.com/multiversx/mx-chain-vm-go => github.com/xorewa/mx-chain-vm-go v0.0.0-20260730142721-5e8c7a0120df
-
-replace github.com/multiversx/mx-chain-es-indexer-go => github.com/xorewa/mx-chain-es-indexer-go v0.0.0-20260727074737-1e9e222c21e6
-
-replace github.com/multiversx/concurrent-map => github.com/xorewa/concurrent-map v0.0.0-20260811090152-c00ff30c0c2e
+replace github.com/ipfs/go-log/v2 => github.com/sstanculeanu/go-log/v2 v2.0.0-20260714113044-ce58d5968237

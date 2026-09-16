@@ -36,7 +36,6 @@ type collector struct {
 	stateAccessesForHeader map[string]*committedStateAccesses
 	retainedMut            sync.RWMutex
 	headerHash             []byte
-	headerGeneration       uint64
 	headerScopeMut         sync.RWMutex
 
 	storer           state.StateAccessesStorer
@@ -107,26 +106,19 @@ func (c *collector) Reset() {
 }
 
 // BeginExecution sets the identity for the next state commit
-func (c *collector) BeginExecution(headerHash []byte) uint64 {
+func (c *collector) BeginExecution(headerHash []byte) {
 	c.headerScopeMut.Lock()
-	c.headerGeneration++
-	if c.headerGeneration == 0 {
-		c.headerGeneration++
-	}
-	generation := c.headerGeneration
 	if len(c.headerHash) > 0 {
 		log.Warn("replacing active state accesses header scope", "headerHash", c.headerHash)
 	}
 	c.headerHash = append(c.headerHash[:0], headerHash...)
 	c.headerScopeMut.Unlock()
-
-	return generation
 }
 
-// EndExecution clears the identity when the generation is still current
-func (c *collector) EndExecution(generation uint64) {
+// EndExecution clears the identity when it still belongs to the given header
+func (c *collector) EndExecution(headerHash []byte) {
 	c.headerScopeMut.Lock()
-	if c.headerGeneration == generation {
+	if bytes.Equal(c.headerHash, headerHash) {
 		c.headerHash = nil
 	}
 	c.headerScopeMut.Unlock()
@@ -276,27 +268,28 @@ func (c *collector) CommitCollectedAccesses(rootHash []byte) error {
 	if len(headerHash) > 0 {
 		c.retainedMut.RLock()
 		retained := c.stateAccessesForHeader[string(headerHash)]
-		c.retainedMut.RUnlock()
 		if retained != nil {
 			if !bytes.Equal(retained.rootHash, rootHash) {
-				return &state.StateAccessesRootMismatchError{
+				mismatchErr := &state.StateAccessesRootMismatchError{
 					HeaderHash:   headerHash,
 					ExpectedRoot: append([]byte(nil), retained.rootHash...),
 					ActualRoot:   append([]byte(nil), rootHash...),
 				}
+				c.retainedMut.RUnlock()
+				return mismatchErr
 			}
 
-			if !equalStateAccessesForTxs(retained.accesses, collectedStateAccesses) {
-				// keep the conflicting payload in the working set so it is not
-				// silently lost together with the error
+			conflictingRetry := !equalStateAccessesForTxs(retained.accesses, collectedStateAccesses)
+			c.retainedMut.RUnlock()
+			if conflictingRetry {
 				c.restoreCollectedStateAccesses(collectedStateAccesses)
 				return fmt.Errorf("%w for header hash %s",
 					state.ErrStateAccessesExecutionConflict, hex.EncodeToString(headerHash))
 			}
 
-			// identical retry: idempotent success, no double store
 			return nil
 		}
+		c.retainedMut.RUnlock()
 	}
 
 	err := c.storer.Store(collectedStateAccesses)
@@ -326,6 +319,7 @@ func (c *collector) CommitCollectedAccesses(rootHash []byte) error {
 func (c *collector) restoreCollectedStateAccesses(collected stateAccessesForTxs) {
 	c.stateAccessesMut.Lock()
 	defer c.stateAccessesMut.Unlock()
+
 	for txHash, accesses := range collected {
 		if _, exists := c.stateAccessesForTxs[txHash]; !exists {
 			c.stateAccessesForTxs[txHash] = accesses
@@ -343,6 +337,7 @@ func equalStateAccessesForTxs(first, second map[string]*data.StateAccesses) bool
 			return false
 		}
 	}
+
 	return true
 }
 

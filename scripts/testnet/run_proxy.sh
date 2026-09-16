@@ -67,7 +67,7 @@ setTerminalSession "$PROXY_SESSION"
 setTerminalLayout "even-vertical"
 setWorkdirForNextCommands "$TESTNETDIR/proxy"
 
-runCommandInTerminal "./proxy"
+runCommandInTerminal "./proxy --start-swagger-ui -log-save -log-level $LOGLEVEL |& tee stdout.txt"
 
 echo "Proxy started in tmux session '$PROXY_SESSION'."
 

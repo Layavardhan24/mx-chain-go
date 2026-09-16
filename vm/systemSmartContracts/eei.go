@@ -791,7 +791,7 @@ func (host *vmContext) AddTxValueToSmartContract(value *big.Int, scAddress []byt
 	if !exists {
 		persistedBalance := big.NewInt(0)
 		account, err := host.blockChainHook.GetUserAccount(scAddress)
-		if err == nil {
+		if err == nil && !check.IfNil(account) {
 			accountBalance := account.GetBalance()
 			if accountBalance != nil {
 				persistedBalance.Set(accountBalance)

@@ -389,7 +389,7 @@
     ]
 
     # MaxNodesChangeEnableEpoch holds configuration for changing the maximum number of nodes and the enabling epoch
-    MaxNodesChangeEnableEpoch = [
+     MaxNodesChangeEnableEpoch = [
         { EpochEnable = 0, MaxNumNodes = 64, NodesToShufflePerShard = 1 },  # 4 shuffled out keys / shard will not be reached normally
         { EpochEnable = 1, MaxNumNodes = 64, NodesToShufflePerShard = 1 },
         # Staking v4 configuration, where:
